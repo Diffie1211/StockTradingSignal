@@ -1,0 +1,34 @@
+name: Daily Stock Signal Email
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs on weekdays at 22:00 UTC, safely after U.S. market close.
+    - cron: "0 22 * * 1-5"
+
+jobs:
+  send-daily-email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send daily stock signal email
+        run: python send_daily_update.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          APP_PUBLIC_URL: ${{ secrets.APP_PUBLIC_URL }}
