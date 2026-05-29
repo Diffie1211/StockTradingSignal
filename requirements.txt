@@ -3,3 +3,5 @@ pandas
 requests
 python-dotenv
 alpaca-py
+lxml
+html5lib

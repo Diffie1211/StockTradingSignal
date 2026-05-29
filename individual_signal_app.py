@@ -1,4 +1,5 @@
 import os
+from io import StringIO
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,17 @@ from alpaca.data.enums import DataFeed
 
 
 # ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Diffie's Stock Signal Scanner",
+    page_icon="📈",
+    layout="wide",
+)
+
+
+# ============================================================
 # SETTINGS
 # ============================================================
 
@@ -23,10 +35,20 @@ LOOKBACK_DAYS = 260
 CROSS_LOOKBACK_DAYS = 3
 STOP_LOSS_PCT = 0.10
 MAX_DISTANCE_ABOVE_MA20 = 1.20
+
+# Box Theory uses previous 7 completed daily candles.
+BOX_LOOKBACK_DAYS = 7
+
+# There are 6 buy checks total after Box Theory is included.
 WATCHLIST_MIN_BUY_SCORE = 4
+
+SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+CHUNK_SIZE = 100
 
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+
+CACHE_TTL_SECONDS = 3600
 
 
 # ============================================================
@@ -34,6 +56,7 @@ SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
 # ============================================================
 
 load_dotenv()
+
 
 def get_secret(name: str, default=None):
     env_value = os.getenv(name)
@@ -55,7 +78,10 @@ SEC_USER_AGENT = get_secret(
 )
 
 if not api_key or not secret_key:
-    st.error("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY in .env file.")
+    st.error(
+        "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY. "
+        "Add them to your local .env file or Streamlit Cloud Secrets."
+    )
     st.stop()
 
 data_client = StockHistoricalDataClient(
@@ -65,21 +91,10 @@ data_client = StockHistoricalDataClient(
 
 
 # ============================================================
-# PAGE CONFIG
+# MARKET DATA
 # ============================================================
 
-st.set_page_config(
-    page_title="Diffie's Stock Signal Scanner",
-    page_icon="📈",
-    layout="wide",
-)
-
-
-# ============================================================
-# DATA FUNCTIONS
-# ============================================================
-
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_daily_bars(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     symbol = symbol.strip().upper()
 
@@ -118,7 +133,59 @@ def get_daily_bars(symbol: str, days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     raise RuntimeError(f"Could not load daily bars for {symbol}. Last error: {last_error}")
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def get_daily_bars_for_symbols(symbols: list[str], days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    all_bars = []
+    last_error = None
+
+    for i in range(0, len(symbols), CHUNK_SIZE):
+        chunk = symbols[i:i + CHUNK_SIZE]
+        chunk_loaded = False
+
+        for feed in [DataFeed.SIP, DataFeed.IEX]:
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=chunk,
+                    timeframe=TimeFrame.Day,
+                    start=start,
+                    end=end,
+                    feed=feed,
+                )
+
+                bars = data_client.get_stock_bars(request).df
+
+                if bars.empty:
+                    continue
+
+                if isinstance(bars.index, pd.MultiIndex):
+                    bars = bars.reset_index()
+
+                bars = bars.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+                all_bars.append(bars)
+
+                chunk_loaded = True
+                break
+
+            except Exception as e:
+                last_error = e
+
+        if not chunk_loaded:
+            print(f"Could not load chunk {i}-{i + CHUNK_SIZE}. Last error: {last_error}")
+
+    if not all_bars:
+        raise RuntimeError(f"No bars loaded. Last error: {last_error}")
+
+    return pd.concat(all_bars, ignore_index=True)
+
+
 def remove_unfinished_daily_candle(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keeps completed daily candles only.
+    If the app is run before 4:10 PM New York time, today's candle is removed.
+    """
     if df.empty:
         return df
 
@@ -173,16 +240,30 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_box_theory_levels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Box Theory:
+    - Box top = highest high from previous BOX_LOOKBACK_DAYS completed daily candles.
+    - Box bottom = lowest low from previous BOX_LOOKBACK_DAYS completed daily candles.
+    - shift(1) prevents today's candle from building today's box.
+    """
+    df["BOX_TOP"] = df["high"].shift(1).rolling(BOX_LOOKBACK_DAYS).max()
+    df["BOX_BOTTOM"] = df["low"].shift(1).rolling(BOX_LOOKBACK_DAYS).min()
+    df["BOX_MID"] = (df["BOX_TOP"] + df["BOX_BOTTOM"]) / 2
+    return df
+
+
 def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = remove_unfinished_daily_candle(df)
     df = add_kdj(df)
     df = add_macd(df)
     df = add_moving_averages(df)
+    df = add_box_theory_levels(df)
     return df
 
 
 # ============================================================
-# SIGNAL FUNCTIONS
+# SIGNAL HELPERS
 # ============================================================
 
 def cross_up(prev_a, prev_b, now_a, now_b) -> bool:
@@ -234,11 +315,15 @@ def three_consecutive_down_closes(df: pd.DataFrame) -> bool:
 
 def suggested_action(signal: str) -> str:
     if signal == "BUY SIGNAL":
-        return "Consider manual buy next trading day around 9:45 AM ET using a limit order."
-    if signal == "SELL SIGNAL":
-        return "Review your holding and consider selling manually."
+        return "Best setup. Consider manual buy next trading day around 9:45 AM ET using a limit order."
+    if signal == "ALMOST BUY":
+        return "Very close setup. Consider waiting for the missing condition to confirm."
     if signal == "WATCHLIST":
-        return "Almost ready. Watch the next completed daily candle."
+        return "Good candidate, but not ready yet. Watch the next completed daily candle."
+    if signal == "SELL SIGNAL":
+        return "Review your holding carefully. A major sell rule or multiple sell warnings triggered."
+    if signal == "CAUTION HOLD":
+        return "One warning triggered, but not enough for a full sell signal. Monitor closely."
     if signal == "HOLD":
         return "You marked this as holding, and no sell rule triggered."
     return "No action. Wait for a cleaner setup."
@@ -335,7 +420,6 @@ def find_fact_series(
                 continue
 
             items = []
-
             for item in units[unit]:
                 form = item.get("form", "")
                 value = item.get("val")
@@ -604,38 +688,31 @@ def build_fundamental_summary(symbol: str) -> dict:
     return {
         "company_name": company_name,
         "cik": cik,
-
         "revenue": revenue_value,
         "revenue_prev": revenue_prev_value,
         "revenue_growth": revenue_growth,
         "revenue_fy": revenue_latest.get("fy") if revenue_latest else "N/A",
         "revenue_filed": revenue_latest.get("filed") if revenue_latest else "N/A",
-
         "net_income": net_income_value,
         "net_income_prev": net_income_prev_value,
         "net_income_growth": net_income_growth,
-
         "operating_income": operating_income_value,
         "operating_cash_flow": ocf_value,
-
         "assets": assets_value,
         "liabilities": liabilities_value,
         "equity": equity_value,
         "liability_to_assets": liability_to_assets,
-
         "eps": eps_value,
         "eps_prev": eps_prev_value,
         "eps_growth": eps_growth,
-
         "net_margin": net_margin,
         "operating_margin": operating_margin,
-
         "comments": comments,
     }
 
 
 # ============================================================
-# SCANNER CORE
+# INDIVIDUAL STOCK SCANNER CORE
 # ============================================================
 
 def scan_one_stock(symbol: str, entry_price):
@@ -647,7 +724,7 @@ def scan_one_stock(symbol: str, entry_price):
     stock_df = prepare_indicators(stock_df)
     qqq_df = prepare_indicators(qqq_df)
 
-    if len(stock_df) < 50:
+    if len(stock_df) < max(50, BOX_LOOKBACK_DAYS + 10):
         raise RuntimeError(f"Not enough data for {symbol}.")
 
     if len(qqq_df) < 50:
@@ -660,6 +737,20 @@ def scan_one_stock(symbol: str, entry_price):
     ma10 = float(latest["MA10"])
     ma20 = float(latest["MA20"])
 
+    box_top = float(latest["BOX_TOP"])
+    box_bottom = float(latest["BOX_BOTTOM"])
+    box_mid = float(latest["BOX_MID"])
+
+    if pd.isna(box_top) or pd.isna(box_bottom):
+        raise RuntimeError(f"Not enough Box Theory data for {symbol}.")
+
+    box_range = box_top - box_bottom
+
+    if box_range > 0:
+        box_position_pct = (latest_close - box_bottom) / box_range * 100
+    else:
+        box_position_pct = None
+
     qqq_close = float(qqq_latest["close"])
     qqq_ma20 = float(qqq_latest["MA20"])
     qqq_above_ma20 = qqq_close > qqq_ma20
@@ -671,17 +762,20 @@ def scan_one_stock(symbol: str, entry_price):
     stock_above_ma20 = latest_close > ma20
     not_too_extended = latest_close <= ma20 * MAX_DISTANCE_ABOVE_MA20
 
+    box_breakout = latest_close > box_top
+    box_breakdown = latest_close < box_bottom
+
     buy_checks = {
         "KDJ golden cross within last 3 completed daily candles": kdj_cross_recent,
         "MACD golden cross within last 3 completed daily candles": macd_cross_recent,
         "Stock close > stock MA20": stock_above_ma20,
         "QQQ close > QQQ MA20": qqq_above_ma20,
         f"Stock close <= MA20 * {MAX_DISTANCE_ABOVE_MA20}": not_too_extended,
+        f"Box Theory breakout: close > previous {BOX_LOOKBACK_DAYS}-day box top": box_breakout,
     }
 
     buy_score = sum(1 for value in buy_checks.values() if value)
     buy_total = len(buy_checks)
-    buy_test_pass = buy_score == buy_total
 
     three_down_days = three_consecutive_down_closes(stock_df)
     macd_cross_down = crossed_down_today(stock_df, "MACD", "MACD_SIGNAL")
@@ -698,21 +792,33 @@ def scan_one_stock(symbol: str, entry_price):
         "Three consecutive down closes": three_down_days,
         "MACD crossed down today": macd_cross_down,
         "Stock close < stock MA10": close_below_ma10,
+        f"Box Theory breakdown: close < previous {BOX_LOOKBACK_DAYS}-day box bottom": box_breakdown,
         "Stop loss hit": stop_loss_signal,
     }
 
-    sell_test_pass = any(sell_checks.values())
+    sell_warning_count = sum(1 for value in sell_checks.values() if value)
 
-    if holding and sell_test_pass:
-        final_signal = "SELL SIGNAL"
-    elif holding and not sell_test_pass:
-        final_signal = "HOLD"
-    elif not holding and buy_test_pass:
-        final_signal = "BUY SIGNAL"
-    elif not holding and buy_score >= WATCHLIST_MIN_BUY_SCORE:
-        final_signal = "WATCHLIST"
+    hard_sell_signal = stop_loss_signal or box_breakdown
+    medium_sell_signal = sell_warning_count >= 2
+
+    stock_safety_filters_pass = stock_above_ma20 and qqq_above_ma20 and not_too_extended
+
+    if holding:
+        if hard_sell_signal or medium_sell_signal:
+            final_signal = "SELL SIGNAL"
+        elif sell_warning_count == 1:
+            final_signal = "CAUTION HOLD"
+        else:
+            final_signal = "HOLD"
     else:
-        final_signal = "NO ACTION"
+        if buy_score == buy_total:
+            final_signal = "BUY SIGNAL"
+        elif buy_score == buy_total - 1 and stock_safety_filters_pass:
+            final_signal = "ALMOST BUY"
+        elif buy_score >= WATCHLIST_MIN_BUY_SCORE and stock_safety_filters_pass:
+            final_signal = "WATCHLIST"
+        else:
+            final_signal = "NO ACTION"
 
     distance_from_ma20_pct = (latest_close / ma20 - 1) * 100
     max_allowed_price = ma20 * MAX_DISTANCE_ABOVE_MA20
@@ -730,14 +836,223 @@ def scan_one_stock(symbol: str, entry_price):
         "max_allowed_price": max_allowed_price,
         "qqq_close": qqq_close,
         "qqq_ma20": qqq_ma20,
+        "box_top": box_top,
+        "box_bottom": box_bottom,
+        "box_mid": box_mid,
+        "box_position_pct": box_position_pct,
+        "box_breakout": box_breakout,
+        "box_breakdown": box_breakdown,
         "buy_checks": buy_checks,
         "buy_score": buy_score,
         "buy_total": buy_total,
         "sell_checks": sell_checks,
-        "sell_test_pass": sell_test_pass,
+        "sell_warning_count": sell_warning_count,
+        "hard_sell_signal": hard_sell_signal,
+        "medium_sell_signal": medium_sell_signal,
         "stop_loss_price": stop_loss_price,
         "stock_df": stock_df,
     }
+
+
+# ============================================================
+# S&P 500 SCANNER CORE
+# ============================================================
+
+@st.cache_data(ttl=86400)
+def get_sp500_symbols() -> pd.DataFrame:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36 "
+            "DiffiesStockSignalScanner/1.0"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    response = requests.get(
+        SP500_URL,
+        headers=headers,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    tables = pd.read_html(StringIO(response.text))
+    df = tables[0].copy()
+
+    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+    df["Security"] = df["Security"].astype(str)
+    df["GICS Sector"] = df["GICS Sector"].astype(str)
+    df["GICS Sub-Industry"] = df["GICS Sub-Industry"].astype(str)
+
+    return df[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]]
+
+
+def scan_one_sp500_symbol(
+    symbol: str,
+    company_name: str,
+    sector: str,
+    sub_industry: str,
+    df: pd.DataFrame,
+    qqq_above_ma20: bool,
+) -> dict:
+    df = df.copy()
+    df = prepare_indicators(df)
+
+    if len(df) < max(50, BOX_LOOKBACK_DAYS + 10):
+        return {
+            "symbol": symbol,
+            "company_name": company_name,
+            "sector": sector,
+            "sub_industry": sub_industry,
+            "final_signal": "ERROR",
+            "error": "Not enough data",
+        }
+
+    latest = df.iloc[-1]
+
+    latest_close = float(latest["close"])
+    ma20 = float(latest["MA20"])
+
+    box_top = latest["BOX_TOP"]
+    box_bottom = latest["BOX_BOTTOM"]
+
+    if pd.isna(box_top) or pd.isna(box_bottom):
+        return {
+            "symbol": symbol,
+            "company_name": company_name,
+            "sector": sector,
+            "sub_industry": sub_industry,
+            "final_signal": "ERROR",
+            "error": "Not enough Box Theory data",
+        }
+
+    box_top = float(box_top)
+    box_bottom = float(box_bottom)
+
+    kdj_cross_recent = crossed_up_within_last_n_days(df, "K", "D")
+    macd_cross_recent = crossed_up_within_last_n_days(df, "MACD", "MACD_SIGNAL")
+    stock_above_ma20 = latest_close > ma20
+    not_too_extended = latest_close <= ma20 * MAX_DISTANCE_ABOVE_MA20
+    box_breakout = latest_close > box_top
+
+    buy_checks = {
+        "KDJ recent golden cross": kdj_cross_recent,
+        "MACD recent golden cross": macd_cross_recent,
+        "Close > MA20": stock_above_ma20,
+        "QQQ > QQQ MA20": qqq_above_ma20,
+        f"Close <= MA20 * {MAX_DISTANCE_ABOVE_MA20}": not_too_extended,
+        f"Close > previous {BOX_LOOKBACK_DAYS}-day box top": box_breakout,
+    }
+
+    buy_score = sum(1 for value in buy_checks.values() if value)
+    buy_total = len(buy_checks)
+
+    safety_filters_pass = stock_above_ma20 and qqq_above_ma20 and not_too_extended
+
+    failed_checks = [
+        check_name
+        for check_name, passed in buy_checks.items()
+        if not passed
+    ]
+
+    if buy_score == buy_total:
+        final_signal = "BUY SIGNAL"
+    elif buy_score == buy_total - 1 and safety_filters_pass:
+        final_signal = "ALMOST BUY"
+    elif buy_score >= WATCHLIST_MIN_BUY_SCORE and safety_filters_pass:
+        final_signal = "WATCHLIST"
+    else:
+        final_signal = "NO ACTION"
+
+    distance_from_ma20_pct = (latest_close / ma20 - 1) * 100
+
+    return {
+        "symbol": symbol,
+        "company_name": company_name,
+        "sector": sector,
+        "sub_industry": sub_industry,
+        "final_signal": final_signal,
+        "latest_date": str(latest["timestamp"]),
+        "latest_close": round(latest_close, 2),
+        "ma20": round(ma20, 2),
+        "distance_from_ma20_pct": round(distance_from_ma20_pct, 2),
+        "box_top": round(box_top, 2),
+        "box_bottom": round(box_bottom, 2),
+        "buy_score": buy_score,
+        "buy_total": buy_total,
+        "failed_checks": "; ".join(failed_checks),
+        "kdj_cross_recent": kdj_cross_recent,
+        "macd_cross_recent": macd_cross_recent,
+        "stock_above_ma20": stock_above_ma20,
+        "qqq_above_ma20": qqq_above_ma20,
+        "not_too_extended": not_too_extended,
+        "box_breakout": box_breakout,
+    }
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
+    sp500 = get_sp500_symbols()
+    symbols = sp500["Symbol"].tolist()
+
+    symbols_to_download = sorted(set(symbols + [MARKET_FILTER_SYMBOL]))
+    all_bars = get_daily_bars_for_symbols(symbols_to_download)
+
+    qqq_df = all_bars[all_bars["symbol"] == MARKET_FILTER_SYMBOL].copy()
+    qqq_df = prepare_indicators(qqq_df)
+
+    if len(qqq_df) < 50:
+        raise RuntimeError("Not enough QQQ data.")
+
+    qqq_latest = qqq_df.iloc[-1]
+    qqq_close = float(qqq_latest["close"])
+    qqq_ma20 = float(qqq_latest["MA20"])
+    qqq_above_ma20 = qqq_close > qqq_ma20
+
+    market_info = {
+        "qqq_close": round(qqq_close, 2),
+        "qqq_ma20": round(qqq_ma20, 2),
+        "qqq_above_ma20": qqq_above_ma20,
+        "qqq_latest_date": str(qqq_latest["timestamp"]),
+    }
+
+    results = []
+
+    for _, row in sp500.iterrows():
+        symbol = row["Symbol"]
+        company_name = row["Security"]
+        sector = row["GICS Sector"]
+        sub_industry = row["GICS Sub-Industry"]
+
+        symbol_df = all_bars[all_bars["symbol"] == symbol].copy()
+
+        if symbol_df.empty:
+            results.append({
+                "symbol": symbol,
+                "company_name": company_name,
+                "sector": sector,
+                "sub_industry": sub_industry,
+                "final_signal": "ERROR",
+                "error": "No bars returned from Alpaca",
+            })
+            continue
+
+        result = scan_one_sp500_symbol(
+            symbol=symbol,
+            company_name=company_name,
+            sector=sector,
+            sub_industry=sub_industry,
+            df=symbol_df,
+            qqq_above_ma20=qqq_above_ma20,
+        )
+
+        results.append(result)
+
+    results_df = pd.DataFrame(results)
+
+    return results_df, market_info
 
 
 # ============================================================
@@ -749,91 +1064,61 @@ def show_strategy_explanation():
 
     st.info(
         "This scanner is a manual trading helper. It does not buy or sell stocks. "
-        "It checks whether a stock matches Diffie's daily momentum strategy."
+        "It checks whether a stock matches Diffie's daily momentum + Box Theory strategy."
     )
 
     with st.expander("📌 Strategy Summary", expanded=True):
         st.markdown(
             """
-            This strategy looks for stocks that are starting to move upward with momentum, 
-            while also avoiding weak market conditions.
+            This strategy looks for stocks that are starting to move upward with momentum,
+            while also avoiding weak market conditions and avoiding fake breakouts.
 
             **Buy idea:**  
-            The scanner looks for a stock where both **KDJ** and **MACD** recently turned bullish, 
-            and the stock is trading above its 20-day moving average.
+            The scanner looks for a stock where **KDJ** and **MACD** recently turned bullish,
+            the stock is above its 20-day moving average, QQQ confirms the broader market is healthy,
+            and the stock breaks above its recent Box Theory resistance level.
 
             **Sell idea:**  
-            If you already hold the stock, the scanner checks whether weakness is appearing, 
-            such as a MACD bearish cross, price falling below the 10-day moving average, 
-            three down days in a row, or a 10% stop-loss.
+            If you already hold the stock, the scanner checks whether weakness is appearing,
+            such as a MACD bearish cross, price falling below the 10-day moving average,
+            three down days in a row, Box Theory breakdown, or a 10% stop-loss.
             """
         )
 
-    with st.expander("✅ Buy Conditions Explained"):
+    with st.expander("📦 Box Theory Explained"):
         st.markdown(
             f"""
-            A stock gets a **BUY SIGNAL** only when all buy checks pass:
+            Box Theory looks for a stock trading inside a recent price range.
 
-            1. **KDJ golden cross within last 3 daily candles**  
-               K moves above D. This suggests short-term momentum is improving.
+            In this scanner:
 
-            2. **MACD golden cross within last 3 daily candles**  
-               MACD moves above its signal line. This suggests trend momentum is turning bullish.
-
-            3. **Stock close > 20-day moving average**  
-               The stock is trading above its recent trend level.
-
-            4. **QQQ close > QQQ 20-day moving average**  
-               The broader tech/growth market is healthy. This helps avoid buying when the market is weak.
-
-            5. **Stock is not too far above MA20**  
-               The stock close must be less than or equal to:
-
-               `MA20 × {MAX_DISTANCE_ABOVE_MA20}`
-
-               This helps avoid chasing a stock after it has already moved too far.
+            - **Box top** = highest high from the previous `{BOX_LOOKBACK_DAYS}` completed daily candles.
+            - **Box bottom** = lowest low from the previous `{BOX_LOOKBACK_DAYS}` completed daily candles.
+            - **Box breakout** = latest close is above the box top.
+            - **Box breakdown** = latest close is below the box bottom.
             """
         )
 
-    with st.expander("🔻 Sell Conditions Explained"):
-        st.markdown(
-            f"""
-            If you mark the stock as **Holding**, the scanner checks sell conditions.
-
-            A stock gets a **SELL SIGNAL** if any of these happen:
-
-            1. **Three consecutive down closes**  
-               The stock closed lower for three completed daily candles in a row.
-
-            2. **MACD crossed down today**  
-               MACD moved below its signal line. This can suggest momentum is weakening.
-
-            3. **Stock close < 10-day moving average**  
-               The stock has fallen below its short-term trend.
-
-            4. **Stop loss hit**  
-               If you enter your entry price, the scanner calculates:
-
-               `Stop loss price = Entry price × {1 - STOP_LOSS_PCT}`
-
-               With the current setting, this is a **10% stop loss**.
-            """
-        )
-
-    with st.expander("📊 What Each Signal Means"):
+    with st.expander("📊 Signal Meaning"):
         st.markdown(
             """
             **BUY SIGNAL**  
-            All buy conditions passed. This means the stock matches the strategy setup.
+            Strongest setup. All buy conditions passed.
 
-            **WATCHLIST / Almost Buy**  
-            Most buy conditions passed, but not all. The stock may be close to a setup.
+            **ALMOST BUY**  
+            Very close setup. Only one buy condition is missing, and safety filters are okay.
+
+            **WATCHLIST**  
+            Interesting candidate, but not ready yet.
 
             **HOLD**  
             You marked the stock as holding, and no sell rule was triggered.
 
+            **CAUTION HOLD**  
+            One sell warning appeared, but not enough for a full sell signal.
+
             **SELL SIGNAL**  
-            You marked the stock as holding, and at least one sell rule was triggered.
+            A major sell rule or multiple sell warnings were triggered.
 
             **NO ACTION**  
             The stock does not currently match the buy or sell setup.
@@ -859,10 +1144,14 @@ def show_signal_card(result: dict):
 
     if signal == "BUY SIGNAL":
         st.success(f"🚀 {symbol}: BUY SIGNAL")
+    elif signal == "ALMOST BUY":
+        st.warning(f"🟡 {symbol}: ALMOST BUY")
+    elif signal == "WATCHLIST":
+        st.warning(f"👀 {symbol}: WATCHLIST")
     elif signal == "SELL SIGNAL":
         st.error(f"🔻 {symbol}: SELL SIGNAL")
-    elif signal == "WATCHLIST":
-        st.warning(f"👀 {symbol}: WATCHLIST / Almost Buy")
+    elif signal == "CAUTION HOLD":
+        st.warning(f"⚠️ {symbol}: CAUTION HOLD")
     elif signal == "HOLD":
         st.info(f"🟦 {symbol}: HOLD")
     else:
@@ -874,37 +1163,30 @@ def show_signal_card(result: dict):
 def show_reason_summary(result: dict):
     st.subheader("Reason Summary")
 
-    signal = result["final_signal"]
-
     passed_buy = [k for k, v in result["buy_checks"].items() if v]
     failed_buy = [k for k, v in result["buy_checks"].items() if not v]
     passed_sell = [k for k, v in result["sell_checks"].items() if v]
 
-    if signal in ["BUY SIGNAL", "WATCHLIST", "NO ACTION"]:
-        st.write("**Passed buy checks:**")
+    st.write("**Passed buy checks:**")
+    if passed_buy:
+        for item in passed_buy:
+            st.write(f"✅ {item}")
+    else:
+        st.write("None")
 
-        if passed_buy:
-            for item in passed_buy:
-                st.write(f"✅ {item}")
-        else:
-            st.write("None")
+    st.write("**Failed buy checks:**")
+    if failed_buy:
+        for item in failed_buy:
+            st.write(f"❌ {item}")
+    else:
+        st.write("None")
 
-        st.write("**Failed buy checks:**")
-
-        if failed_buy:
-            for item in failed_buy:
-                st.write(f"❌ {item}")
-        else:
-            st.write("None")
-
-    if signal in ["SELL SIGNAL", "HOLD"]:
-        st.write("**Sell checks triggered:**")
-
-        if passed_sell:
-            for item in passed_sell:
-                st.write(f"✅ {item}")
-        else:
-            st.write("None")
+    st.write("**Sell checks triggered:**")
+    if passed_sell:
+        for item in passed_sell:
+            st.write(f"✅ {item}")
+    else:
+        st.write("None")
 
 
 def show_price_chart(result: dict):
@@ -912,7 +1194,7 @@ def show_price_chart(result: dict):
 
     df = result["stock_df"].copy().tail(120)
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-    chart_df = df.set_index("date")[["close", "MA10", "MA20"]]
+    chart_df = df.set_index("date")[["close", "MA10", "MA20", "BOX_TOP", "BOX_BOTTOM"]]
 
     st.line_chart(chart_df)
 
@@ -956,20 +1238,9 @@ def show_fundamentals(symbol: str):
 
         col4, col5, col6 = st.columns(3)
 
-        col4.metric(
-            "Operating Margin",
-            format_pct(summary["operating_margin"]),
-        )
-
-        col5.metric(
-            "Net Margin",
-            format_pct(summary["net_margin"]),
-        )
-
-        col6.metric(
-            "Liabilities / Assets",
-            format_pct(summary["liability_to_assets"]),
-        )
+        col4.metric("Operating Margin", format_pct(summary["operating_margin"]))
+        col5.metric("Net Margin", format_pct(summary["net_margin"]))
+        col6.metric("Liabilities / Assets", format_pct(summary["liability_to_assets"]))
 
         st.write("**Balance Sheet / Cash Flow**")
 
@@ -997,120 +1268,358 @@ def show_fundamentals(symbol: str):
 
 
 # ============================================================
-# STREAMLIT PAGE
+# APP UI
 # ============================================================
 
 st.title("📈 Diffie's Stock Signal Scanner")
-st.caption("KDJ + MACD + MA strategy. Manual trading only. No order submission.")
-
-show_strategy_explanation()
+st.caption("KDJ + MACD + MA + Box Theory strategy. Manual trading only. No order submission.")
 
 with st.sidebar:
+    st.header("About Diffie")
+
+    st.markdown(
+        """
+        **Diffie Liu**  
+        Future CPA | Wake Forest & UCR Alum
+
+        I built this scanner to turn my personal daily stock-analysis process
+        into a simple, transparent tool.
+
+        My approach is **not day trading**. I focus on completed daily candles,
+        momentum confirmation, trend direction, Box Theory structure, and
+        financial reference data.
+
+        This scanner is for **manual decision support only**. It does not place trades.
+        """
+    )
+
+    st.markdown("📧 [diffieliu@gmail.com](mailto:diffieliu@gmail.com)")
+    st.write("📞 909-689-6496")
+
+    st.divider()
+
     st.header("Scanner Settings")
     st.write("Market filter:", MARKET_FILTER_SYMBOL)
     st.write("Cross lookback days:", CROSS_LOOKBACK_DAYS)
+    st.write("Box lookback days:", BOX_LOOKBACK_DAYS)
     st.write("Stop loss:", f"{STOP_LOSS_PCT * 100:.0f}%")
     st.write("Max distance above MA20:", f"{(MAX_DISTANCE_ABOVE_MA20 - 1) * 100:.0f}%")
+
     st.divider()
-    st.caption("Fundamental data uses free SEC EDGAR data when available.")
 
-symbol = st.text_input(
-    "Stock symbol",
-    value="TSLA",
-    help="Example: TSLA, AAPL, NVDA, MSFT",
+    if st.button("Refresh data / clear cache"):
+        st.cache_data.clear()
+        st.rerun()
+
+tab_single, tab_sp500 = st.tabs(
+    [
+        "🔎 Individual Stock Scanner",
+        "📋 S&P 500 Scanner",
+    ]
 )
 
-holding_choice = st.radio(
-    "Are you currently holding this stock?",
-    ["Not Holding", "Holding"],
-    horizontal=True,
-)
 
-entry_price = None
+# ============================================================
+# TAB 1: INDIVIDUAL STOCK SCANNER
+# ============================================================
 
-if holding_choice == "Holding":
-    entry_price = st.number_input(
-        "Your entry price",
-        min_value=0.01,
-        value=100.00,
-        step=0.01,
+with tab_single:
+    show_strategy_explanation()
+
+    symbol = st.text_input(
+        "Stock symbol",
+        value="TSLA",
+        help="Example: TSLA, AAPL, NVDA, MSFT",
     )
 
-show_fundamental_info = st.checkbox(
-    "Show fundamental reference from SEC filings",
-    value=True,
-)
+    holding_choice = st.radio(
+        "Are you currently holding this stock?",
+        ["Not Holding", "Holding"],
+        horizontal=True,
+    )
 
-run_scan = st.button("Scan Signal", type="primary")
+    entry_price = None
 
-if run_scan:
-    try:
-        result = scan_one_stock(symbol, entry_price)
-
-        st.divider()
-        show_signal_card(result)
-
-        st.subheader("Price Levels")
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric("Latest Close", f"{result['latest_close']:.2f}")
-        col2.metric("MA10", f"{result['ma10']:.2f}")
-        col3.metric("MA20", f"{result['ma20']:.2f}")
-        col4.metric("Distance from MA20", f"{result['distance_from_ma20_pct']:.2f}%")
-
-        st.write("Latest completed candle:", result["latest_date"])
-        st.write("Max allowed buy price from MA20 rule:", f"{result['max_allowed_price']:.2f}")
-
-        if result["holding"]:
-            st.write("Entry price:", f"{result['entry_price']:.2f}")
-            st.write("Stop loss price:", f"{result['stop_loss_price']:.2f}")
-
-        st.subheader("Market Filter")
-
-        col5, col6 = st.columns(2)
-
-        col5.metric("QQQ Close", f"{result['qqq_close']:.2f}")
-        col6.metric("QQQ MA20", f"{result['qqq_ma20']:.2f}")
-
-        st.subheader("Buy Checks")
-
-        st.write(f"Buy score: **{result['buy_score']}/{result['buy_total']}**")
-
-        for check_name, passed in result["buy_checks"].items():
-            if passed:
-                st.write(f"✅ {check_name}")
-            else:
-                st.write(f"❌ {check_name}")
-
-        st.subheader("Sell Checks")
-
-        for check_name, passed in result["sell_checks"].items():
-            if passed:
-                st.write(f"✅ {check_name}")
-            else:
-                st.write(f"❌ {check_name}")
-
-        show_reason_summary(result)
-        show_price_chart(result)
-
-        if show_fundamental_info:
-            show_fundamentals(result["symbol"])
-
-        st.divider()
-
-        st.subheader("Copyable Summary")
-
-        summary_text = (
-            f"{result['symbol']} | {result['final_signal']} | "
-            f"Close {result['latest_close']:.2f} | "
-            f"Buy Score {result['buy_score']}/{result['buy_total']} | "
-            f"Distance from MA20 {result['distance_from_ma20_pct']:.2f}%"
+    if holding_choice == "Holding":
+        entry_price = st.number_input(
+            "Your entry price",
+            min_value=0.01,
+            value=100.00,
+            step=0.01,
         )
 
-        st.code(summary_text)
+    show_fundamental_info = st.checkbox(
+        "Show fundamental reference from SEC filings",
+        value=True,
+    )
 
-        st.caption("This page only gives a signal and reference information. It does not place trades.")
+    run_scan = st.button("Scan Individual Stock", type="primary")
 
-    except Exception as e:
-        st.error(str(e))
+    if run_scan:
+        try:
+            result = scan_one_stock(symbol, entry_price)
+
+            st.divider()
+            show_signal_card(result)
+
+            st.subheader("Price Levels")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric("Latest Close", f"{result['latest_close']:.2f}")
+            col2.metric("MA10", f"{result['ma10']:.2f}")
+            col3.metric("MA20", f"{result['ma20']:.2f}")
+            col4.metric("Distance from MA20", f"{result['distance_from_ma20_pct']:.2f}%")
+
+            st.write("Latest completed candle:", result["latest_date"])
+            st.write("Max allowed buy price from MA20 rule:", f"{result['max_allowed_price']:.2f}")
+
+            st.subheader("Box Theory Levels")
+
+            box_col1, box_col2, box_col3, box_col4 = st.columns(4)
+
+            box_col1.metric("Box Top", f"{result['box_top']:.2f}")
+            box_col2.metric("Box Bottom", f"{result['box_bottom']:.2f}")
+            box_col3.metric("Box Mid", f"{result['box_mid']:.2f}")
+
+            if result["box_position_pct"] is not None:
+                box_col4.metric("Position in Box", f"{result['box_position_pct']:.2f}%")
+            else:
+                box_col4.metric("Position in Box", "N/A")
+
+            if result["box_breakout"]:
+                st.success("Box Theory: price closed above the box top.")
+            elif result["box_breakdown"]:
+                st.error("Box Theory: price closed below the box bottom.")
+            else:
+                st.info("Box Theory: price is still inside the box.")
+
+            if result["holding"]:
+                st.write("Entry price:", f"{result['entry_price']:.2f}")
+                st.write("Stop loss price:", f"{result['stop_loss_price']:.2f}")
+
+            st.subheader("Market Filter")
+
+            col5, col6 = st.columns(2)
+
+            col5.metric("QQQ Close", f"{result['qqq_close']:.2f}")
+            col6.metric("QQQ MA20", f"{result['qqq_ma20']:.2f}")
+
+            st.subheader("Buy Checks")
+
+            st.write(f"Buy score: **{result['buy_score']}/{result['buy_total']}**")
+
+            for check_name, passed in result["buy_checks"].items():
+                if passed:
+                    st.write(f"✅ {check_name}")
+                else:
+                    st.write(f"❌ {check_name}")
+
+            st.subheader("Sell Checks")
+
+            st.write(f"Sell warnings triggered: **{result['sell_warning_count']}**")
+
+            for check_name, passed in result["sell_checks"].items():
+                if passed:
+                    st.write(f"✅ {check_name}")
+                else:
+                    st.write(f"❌ {check_name}")
+
+            show_reason_summary(result)
+            show_price_chart(result)
+
+            if show_fundamental_info:
+                show_fundamentals(result["symbol"])
+
+            st.divider()
+
+            st.subheader("Copyable Summary")
+
+            summary_text = (
+                f"{result['symbol']} | {result['final_signal']} | "
+                f"Close {result['latest_close']:.2f} | "
+                f"Buy Score {result['buy_score']}/{result['buy_total']} | "
+                f"Distance from MA20 {result['distance_from_ma20_pct']:.2f}% | "
+                f"Box Top {result['box_top']:.2f} | "
+                f"Box Bottom {result['box_bottom']:.2f}"
+            )
+
+            st.code(summary_text)
+
+            st.caption("This page only gives a signal and reference information. It does not place trades.")
+
+        except Exception as e:
+            st.error(str(e))
+
+
+# ============================================================
+# TAB 2: S&P 500 SCANNER
+# ============================================================
+
+with tab_sp500:
+    st.markdown("## 📋 S&P 500 Signal Scanner")
+
+    st.info(
+        "This scans S&P 500 stocks using the same buy setup. "
+        "It does not check holding-specific sell signals because it does not know your entry prices."
+    )
+
+    with st.expander("How the S&P 500 scan works", expanded=False):
+        st.markdown(
+            f"""
+            The scanner checks each S&P 500 stock using the same buy setup:
+
+            1. KDJ golden cross within the last `{CROSS_LOOKBACK_DAYS}` completed daily candles  
+            2. MACD golden cross within the last `{CROSS_LOOKBACK_DAYS}` completed daily candles  
+            3. Stock close > stock MA20  
+            4. QQQ close > QQQ MA20  
+            5. Stock is not more than `{(MAX_DISTANCE_ABOVE_MA20 - 1) * 100:.0f}%` above MA20  
+            6. Stock closes above its previous `{BOX_LOOKBACK_DAYS}`-day Box Theory top  
+
+            Signal judgment:
+
+            - **BUY SIGNAL** = 6/6 checks passed  
+            - **ALMOST BUY** = 5/6 checks passed and safety filters passed  
+            - **WATCHLIST** = 4+ checks passed and safety filters passed  
+            - **NO ACTION** = setup is not ready  
+            """
+        )
+
+    run_sp500_scan = st.button("Run S&P 500 Scan", type="primary")
+
+    if run_sp500_scan:
+        try:
+            with st.spinner("Scanning S&P 500 stocks. This may take a few minutes..."):
+                results_df, market_info = scan_sp500_cached()
+
+            st.divider()
+
+            st.subheader("Market Filter")
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric("QQQ Close", market_info["qqq_close"])
+            col2.metric("QQQ MA20", market_info["qqq_ma20"])
+            col3.metric("QQQ > MA20", str(market_info["qqq_above_ma20"]))
+
+            st.write("QQQ latest completed candle:", market_info["qqq_latest_date"])
+
+            st.divider()
+
+            signal_counts = results_df["final_signal"].value_counts().to_dict()
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+
+            c1.metric("BUY", signal_counts.get("BUY SIGNAL", 0))
+            c2.metric("ALMOST BUY", signal_counts.get("ALMOST BUY", 0))
+            c3.metric("WATCHLIST", signal_counts.get("WATCHLIST", 0))
+            c4.metric("NO ACTION", signal_counts.get("NO ACTION", 0))
+            c5.metric("ERROR", signal_counts.get("ERROR", 0))
+
+            st.subheader("Filter Results")
+
+            available_signals = [
+                "BUY SIGNAL",
+                "ALMOST BUY",
+                "WATCHLIST",
+                "NO ACTION",
+                "ERROR",
+            ]
+
+            selected_signals = st.multiselect(
+                "Signal filter",
+                available_signals,
+                default=["BUY SIGNAL", "ALMOST BUY"],
+            )
+
+            sectors = sorted(results_df["sector"].dropna().unique().tolist())
+
+            selected_sectors = st.multiselect(
+                "Sector filter",
+                sectors,
+                default=sectors,
+            )
+
+            search_text = st.text_input(
+                "Search symbol or company",
+                value="",
+            ).strip().upper()
+
+            filtered_df = results_df[
+                results_df["final_signal"].isin(selected_signals)
+                & results_df["sector"].isin(selected_sectors)
+            ].copy()
+
+            if search_text:
+                filtered_df = filtered_df[
+                    filtered_df["symbol"].str.upper().str.contains(search_text, na=False)
+                    | filtered_df["company_name"].str.upper().str.contains(search_text, na=False)
+                ].copy()
+
+            if not filtered_df.empty and "buy_score" in filtered_df.columns:
+                filtered_df = filtered_df.sort_values(
+                    ["final_signal", "buy_score", "distance_from_ma20_pct"],
+                    ascending=[True, False, True],
+                )
+
+            display_columns = [
+                "symbol",
+                "company_name",
+                "sector",
+                "sub_industry",
+                "final_signal",
+                "latest_close",
+                "buy_score",
+                "buy_total",
+                "distance_from_ma20_pct",
+                "box_top",
+                "box_bottom",
+                "failed_checks",
+            ]
+
+            display_columns = [
+                col for col in display_columns if col in filtered_df.columns
+            ]
+
+            st.subheader("Scanner Results")
+
+            st.dataframe(
+                filtered_df[display_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+
+            st.download_button(
+                label="Download filtered results as CSV",
+                data=csv_data,
+                file_name=f"sp500_signal_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv",
+                mime="text/csv",
+            )
+
+            st.subheader("Top BUY / ALMOST BUY List")
+
+            top_df = results_df[
+                results_df["final_signal"].isin(["BUY SIGNAL", "ALMOST BUY"])
+            ].copy()
+
+            if top_df.empty:
+                st.write("No BUY SIGNAL or ALMOST BUY stocks right now.")
+            else:
+                top_df = top_df.sort_values(
+                    ["buy_score", "distance_from_ma20_pct"],
+                    ascending=[False, True],
+                )
+
+                for _, row in top_df.iterrows():
+                    st.write(
+                        f"**{row['symbol']}** | {row['company_name']} | "
+                        f"{row['final_signal']} | "
+                        f"Score {row['buy_score']}/{row['buy_total']} | "
+                        f"Close {row['latest_close']} | "
+                        f"Missing: {row['failed_checks']}"
+                    )
+
+        except Exception as e:
+            st.error(str(e))
