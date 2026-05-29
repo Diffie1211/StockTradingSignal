@@ -13,6 +13,18 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+from subscription_utils import (
+    SUBSCRIPTION_UNIVERSES,
+    subscription_config_ready,
+    flags_to_selected_universes,
+    get_subscription_by_token,
+    upsert_subscription,
+    update_subscription_by_token,
+    unsubscribe_by_token,
+    unsubscribe_by_email,
+    format_manage_link,
+)
+
 
 # ============================================================
 # PAGE CONFIG
@@ -1394,10 +1406,11 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-tab_single, tab_sp500 = st.tabs(
+tab_single, tab_sp500, tab_subscribe = st.tabs(
     [
         "🔎 Individual Stock Scanner",
         "📋 Index Scanner",
+        "📬 Daily Email Alerts",
     ]
 )
 
@@ -1717,3 +1730,128 @@ with tab_sp500:
 
         except Exception as e:
             st.error(str(e))
+
+
+# ============================================================
+# TAB 3: EMAIL SUBSCRIPTION
+# ============================================================
+
+with tab_subscribe:
+    st.markdown("## 📬 Daily Email Alerts")
+
+    st.info(
+        "Subscribe to receive a daily email with BUY SIGNAL and ALMOST BUY stocks "
+        "from the lists you choose. You can update or cancel your subscription later."
+    )
+
+    if not subscription_config_ready():
+        st.warning(
+            "Subscription is not configured yet. Add SUPABASE_URL, "
+            "SUPABASE_SERVICE_ROLE_KEY, RESEND_API_KEY, and APP_PUBLIC_URL "
+            "to Streamlit Secrets before using this page online."
+        )
+    else:
+        query_token = None
+
+        try:
+            query_token = st.query_params.get("token")
+        except Exception:
+            query_token = None
+
+        existing_subscription = None
+
+        if query_token:
+            try:
+                existing_subscription = get_subscription_by_token(query_token)
+
+                if existing_subscription:
+                    st.success(
+                        f"Managing subscription for {existing_subscription['email']}"
+                    )
+                else:
+                    st.error("This subscription link is invalid or expired.")
+
+            except Exception as e:
+                st.error(f"Could not load subscription: {e}")
+
+        default_email = ""
+        default_universes = ["S&P 500", "Nasdaq-100"]
+
+        if existing_subscription:
+            default_email = existing_subscription["email"]
+            loaded_universes = flags_to_selected_universes(existing_subscription)
+            if loaded_universes:
+                default_universes = loaded_universes
+
+        st.subheader("Subscribe or Update")
+
+        with st.form("daily_email_subscription_form"):
+            email_input = st.text_input(
+                "Email address",
+                value=default_email,
+                disabled=bool(existing_subscription),
+                help="Daily signal emails will be sent to this address.",
+            )
+
+            selected_universes = st.multiselect(
+                "Choose lists for daily updates",
+                SUBSCRIPTION_UNIVERSES,
+                default=default_universes,
+            )
+
+            submitted = st.form_submit_button("Subscribe / Update Subscription")
+
+            if submitted:
+                try:
+                    if not selected_universes:
+                        st.error("Please select at least one list.")
+                    elif existing_subscription and query_token:
+                        updated = update_subscription_by_token(
+                            token=query_token,
+                            selected_universes=selected_universes,
+                        )
+                        st.success("Subscription updated.")
+                        st.write("Selected lists:", ", ".join(flags_to_selected_universes(updated)))
+                        st.write("Manage link:")
+                        st.code(format_manage_link(updated["token"]))
+                    else:
+                        saved = upsert_subscription(
+                            email=email_input,
+                            selected_universes=selected_universes,
+                        )
+                        st.success("Subscription saved.")
+                        st.write("Selected lists:", ", ".join(flags_to_selected_universes(saved)))
+                        st.write("Save this manage/cancel link:")
+                        st.code(format_manage_link(saved["token"]))
+                except Exception as e:
+                    st.error(str(e))
+
+        st.subheader("Cancel Subscription")
+
+        if existing_subscription and query_token:
+            if st.button("Cancel this subscription"):
+                try:
+                    unsubscribe_by_token(query_token)
+                    st.success("Subscription cancelled.")
+                except Exception as e:
+                    st.error(str(e))
+        else:
+            with st.form("unsubscribe_by_email_form"):
+                cancel_email = st.text_input(
+                    "Email address to cancel",
+                    value="",
+                    help="This cancels the subscription for this email address.",
+                )
+                cancel_submitted = st.form_submit_button("Cancel by Email")
+
+                if cancel_submitted:
+                    try:
+                        unsubscribe_by_email(cancel_email)
+                        st.success("Subscription cancelled if the email existed.")
+                    except Exception as e:
+                        st.error(str(e))
+
+        st.caption(
+            "Every daily email includes a private manage link so subscribers can "
+            "change their selected lists or cancel."
+        )
