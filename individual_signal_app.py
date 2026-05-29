@@ -42,7 +42,13 @@ BOX_LOOKBACK_DAYS = 7
 # There are 6 buy checks total after Box Theory is included.
 WATCHLIST_MIN_BUY_SCORE = 4
 
-SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+INDEX_UNIVERSES = {
+    "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+    "Nasdaq-100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+    "Dow 30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+    "S&P 400 MidCap": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+}
+
 CHUNK_SIZE = 100
 
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -855,12 +861,11 @@ def scan_one_stock(symbol: str, entry_price):
 
 
 # ============================================================
-# S&P 500 SCANNER CORE
+# INDEX / UNIVERSE SCANNER CORE
 # ============================================================
 
-@st.cache_data(ttl=86400)
-def get_sp500_symbols() -> pd.DataFrame:
-    headers = {
+def wiki_headers() -> dict:
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -870,26 +875,103 @@ def get_sp500_symbols() -> pd.DataFrame:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+
+@st.cache_data(ttl=86400)
+def read_wikipedia_tables(url: str) -> list[pd.DataFrame]:
     response = requests.get(
-        SP500_URL,
-        headers=headers,
+        url,
+        headers=wiki_headers(),
         timeout=30,
     )
-
     response.raise_for_status()
+    return pd.read_html(StringIO(response.text))
 
-    tables = pd.read_html(StringIO(response.text))
-    df = tables[0].copy()
 
-    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+def clean_symbol(symbol) -> str:
+    symbol = str(symbol).strip().upper()
+    symbol = symbol.replace("\xa0", "")
+    symbol = symbol.replace(" ", "")
+    symbol = symbol.replace("\n", "")
+    return symbol
+
+
+def first_table_with_columns(tables: list[pd.DataFrame], required_columns: list[str]) -> pd.DataFrame:
+    for table in tables:
+        columns = [str(c) for c in table.columns]
+        if all(col in columns for col in required_columns):
+            return table.copy()
+
+    raise RuntimeError(f"Could not find a table with columns: {required_columns}")
+
+
+@st.cache_data(ttl=86400)
+def get_universe_symbols(universe_name: str) -> pd.DataFrame:
+    """
+    Returns a standard table with these columns:
+    Symbol, Security, GICS Sector, GICS Sub-Industry
+    """
+    if universe_name not in INDEX_UNIVERSES:
+        raise RuntimeError(f"Unknown universe: {universe_name}")
+
+    url = INDEX_UNIVERSES[universe_name]
+    tables = read_wikipedia_tables(url)
+
+    if universe_name == "S&P 500":
+        df = first_table_with_columns(tables, ["Symbol", "Security"])
+
+    elif universe_name == "Nasdaq-100":
+        df = first_table_with_columns(tables, ["Ticker", "Company"])
+        df = df.rename(
+            columns={
+                "Ticker": "Symbol",
+                "Company": "Security",
+            }
+        )
+
+    elif universe_name == "Dow 30":
+        df = first_table_with_columns(tables, ["Company", "Symbol"])
+        df = df.rename(
+            columns={
+                "Company": "Security",
+                "Sector": "GICS Sector",
+                "Industry": "GICS Sub-Industry",
+            }
+        )
+
+    elif universe_name == "S&P 400 MidCap":
+        df = first_table_with_columns(tables, ["Symbol", "Security"])
+
+    else:
+        raise RuntimeError(f"Unsupported universe: {universe_name}")
+
+    # Make columns consistent.
+    if "GICS Sector" not in df.columns:
+        if "Sector" in df.columns:
+            df["GICS Sector"] = df["Sector"]
+        else:
+            df["GICS Sector"] = "Unknown"
+
+    if "GICS Sub-Industry" not in df.columns:
+        if "Industry" in df.columns:
+            df["GICS Sub-Industry"] = df["Industry"]
+        else:
+            df["GICS Sub-Industry"] = "Unknown"
+
+    df = df[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].copy()
+
+    df["Symbol"] = df["Symbol"].apply(clean_symbol)
     df["Security"] = df["Security"].astype(str)
     df["GICS Sector"] = df["GICS Sector"].astype(str)
     df["GICS Sub-Industry"] = df["GICS Sub-Industry"].astype(str)
 
-    return df[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]]
+    df = df[df["Symbol"].notna()].copy()
+    df = df[df["Symbol"].str.len() > 0].copy()
+    df = df.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+
+    return df
 
 
-def scan_one_sp500_symbol(
+def scan_one_index_symbol(
     symbol: str,
     company_name: str,
     sector: str,
@@ -993,9 +1075,9 @@ def scan_one_sp500_symbol(
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
-def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
-    sp500 = get_sp500_symbols()
-    symbols = sp500["Symbol"].tolist()
+def scan_universe_cached(universe_name: str) -> tuple[pd.DataFrame, dict]:
+    universe_df = get_universe_symbols(universe_name)
+    symbols = universe_df["Symbol"].tolist()
 
     symbols_to_download = sorted(set(symbols + [MARKET_FILTER_SYMBOL]))
     all_bars = get_daily_bars_for_symbols(symbols_to_download)
@@ -1012,6 +1094,8 @@ def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
     qqq_above_ma20 = qqq_close > qqq_ma20
 
     market_info = {
+        "universe_name": universe_name,
+        "universe_count": len(universe_df),
         "qqq_close": round(qqq_close, 2),
         "qqq_ma20": round(qqq_ma20, 2),
         "qqq_above_ma20": qqq_above_ma20,
@@ -1020,7 +1104,7 @@ def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
 
     results = []
 
-    for _, row in sp500.iterrows():
+    for _, row in universe_df.iterrows():
         symbol = row["Symbol"]
         company_name = row["Security"]
         sector = row["GICS Sector"]
@@ -1039,7 +1123,7 @@ def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
             })
             continue
 
-        result = scan_one_sp500_symbol(
+        result = scan_one_index_symbol(
             symbol=symbol,
             company_name=company_name,
             sector=sector,
@@ -1055,7 +1139,6 @@ def scan_sp500_cached() -> tuple[pd.DataFrame, dict]:
     return results_df, market_info
 
 
-# ============================================================
 # UI HELPERS
 # ============================================================
 
@@ -1314,7 +1397,7 @@ with st.sidebar:
 tab_single, tab_sp500 = st.tabs(
     [
         "🔎 Individual Stock Scanner",
-        "📋 S&P 500 Scanner",
+        "📋 Index Scanner",
     ]
 )
 
@@ -1453,21 +1536,28 @@ with tab_single:
 
 
 # ============================================================
-# TAB 2: S&P 500 SCANNER
+# TAB 2: INDEX / UNIVERSE SCANNER
 # ============================================================
 
 with tab_sp500:
-    st.markdown("## 📋 S&P 500 Signal Scanner")
+    st.markdown("## 📋 Index / Universe Signal Scanner")
 
     st.info(
-        "This scans S&P 500 stocks using the same buy setup. "
+        "This scans a full stock universe using the same buy setup. "
         "It does not check holding-specific sell signals because it does not know your entry prices."
     )
 
-    with st.expander("How the S&P 500 scan works", expanded=False):
+    selected_universe = st.selectbox(
+        "Choose stock universe to scan",
+        list(INDEX_UNIVERSES.keys()),
+        index=0,
+        help="Nasdaq-100 is usually fastest after Dow 30. S&P 400 and S&P 500 may take longer.",
+    )
+
+    with st.expander("How the index scan works", expanded=False):
         st.markdown(
             f"""
-            The scanner checks each S&P 500 stock using the same buy setup:
+            The scanner checks every stock in the selected universe using the same buy setup:
 
             1. KDJ golden cross within the last `{CROSS_LOOKBACK_DAYS}` completed daily candles  
             2. MACD golden cross within the last `{CROSS_LOOKBACK_DAYS}` completed daily candles  
@@ -1485,23 +1575,25 @@ with tab_sp500:
             """
         )
 
-    run_sp500_scan = st.button("Run S&P 500 Scan", type="primary")
+    run_universe_scan = st.button(f"Run {selected_universe} Scan", type="primary")
 
-    if run_sp500_scan:
+    if run_universe_scan:
         try:
-            with st.spinner("Scanning S&P 500 stocks. This may take a few minutes..."):
-                results_df, market_info = scan_sp500_cached()
+            with st.spinner(f"Scanning {selected_universe}. This may take a few minutes..."):
+                results_df, market_info = scan_universe_cached(selected_universe)
 
             st.divider()
 
             st.subheader("Market Filter")
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
-            col1.metric("QQQ Close", market_info["qqq_close"])
-            col2.metric("QQQ MA20", market_info["qqq_ma20"])
-            col3.metric("QQQ > MA20", str(market_info["qqq_above_ma20"]))
+            col1.metric("Universe", market_info["universe_name"])
+            col2.metric("Stocks loaded", market_info["universe_count"])
+            col3.metric("QQQ Close", market_info["qqq_close"])
+            col4.metric("QQQ > MA20", str(market_info["qqq_above_ma20"]))
 
+            st.write("QQQ MA20:", market_info["qqq_ma20"])
             st.write("QQQ latest completed candle:", market_info["qqq_latest_date"])
 
             st.divider()
@@ -1591,10 +1683,12 @@ with tab_sp500:
 
             csv_data = filtered_df.to_csv(index=False).encode("utf-8")
 
+            safe_universe_name = selected_universe.replace(" ", "_").replace("&", "and")
+
             st.download_button(
                 label="Download filtered results as CSV",
                 data=csv_data,
-                file_name=f"sp500_signal_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv",
+                file_name=f"{safe_universe_name}_signal_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv",
                 mime="text/csv",
             )
 
@@ -1605,7 +1699,7 @@ with tab_sp500:
             ].copy()
 
             if top_df.empty:
-                st.write("No BUY SIGNAL or ALMOST BUY stocks right now.")
+                st.write(f"No BUY SIGNAL or ALMOST BUY stocks in {selected_universe} right now.")
             else:
                 top_df = top_df.sort_values(
                     ["buy_score", "distance_from_ma20_pct"],
