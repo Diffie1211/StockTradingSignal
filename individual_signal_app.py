@@ -1389,6 +1389,7 @@ with st.sidebar:
     )
 
     st.markdown("📧 [diffieliu@gmail.com](mailto:diffieliu@gmail.com)")
+    st.markdown("🔗 [LinkedIn: Diffie Liu](https://www.linkedin.com/in/diffie-liu/)")
     st.write("📞 909-689-6496")
 
     st.divider()
