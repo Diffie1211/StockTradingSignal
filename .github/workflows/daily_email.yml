@@ -23,6 +23,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check required secrets
+        run: |
+          test -n "$ALPACA_API_KEY" || (echo "ALPACA_API_KEY missing" && exit 1)
+          test -n "$ALPACA_SECRET_KEY" || (echo "ALPACA_SECRET_KEY missing" && exit 1)
+          test -n "$SUPABASE_URL" || (echo "SUPABASE_URL missing" && exit 1)
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || (echo "SUPABASE_SERVICE_ROLE_KEY missing" && exit 1)
+          test -n "$RESEND_API_KEY" || (echo "RESEND_API_KEY missing" && exit 1)
+          test -n "$RESEND_FROM_EMAIL" || (echo "RESEND_FROM_EMAIL missing" && exit 1)
+          test -n "$APP_PUBLIC_URL" || (echo "APP_PUBLIC_URL missing" && exit 1)
+          echo "All required secrets are present."
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          APP_PUBLIC_URL: ${{ secrets.APP_PUBLIC_URL }}
+
       - name: Send daily stock signal email
         run: python send_daily_update.py
         env:
