@@ -1389,7 +1389,6 @@ with st.sidebar:
     )
 
     st.markdown("📧 [diffieliu@gmail.com](mailto:diffieliu@gmail.com)")
-    st.markdown("🔗 [LinkedIn: Diffie Liu](https://www.linkedin.com/in/diffie-liu/)")
     st.write("📞 909-689-6496")
 
     st.divider()
@@ -1695,9 +1694,21 @@ with tab_sp500:
                 hide_index=True,
             )
 
-            csv_data = filtered_df.to_csv(index=False).encode("utf-8")
-
             safe_universe_name = selected_universe.replace(" ", "_").replace("&", "and")
+
+            filtered_tickers = ", ".join(
+                list(dict.fromkeys(filtered_df["symbol"].dropna().astype(str).tolist()))
+            )
+
+            st.text_area(
+                "Copy tickers from current filtered table",
+                value=filtered_tickers,
+                height=80,
+                key=f"copy_filtered_table_tickers_{safe_universe_name}",
+                help="This copies tickers from the table currently shown above.",
+            )
+
+            csv_data = filtered_df.to_csv(index=False).encode("utf-8")
 
             st.download_button(
                 label="Download filtered results as CSV",
@@ -1714,11 +1725,65 @@ with tab_sp500:
 
             if top_df.empty:
                 st.write(f"No BUY SIGNAL or ALMOST BUY stocks in {selected_universe} right now.")
+
+                st.text_area(
+                    "All BUY SIGNAL + ALMOST BUY tickers",
+                    value="",
+                    height=80,
+                    key=f"copy_buy_almost_empty_{safe_universe_name}",
+                    help="No BUY SIGNAL or ALMOST BUY tickers are available right now.",
+                )
+
             else:
                 top_df = top_df.sort_values(
                     ["buy_score", "distance_from_ma20_pct"],
                     ascending=[False, True],
                 )
+
+                buy_almost_tickers = ", ".join(
+                    list(dict.fromkeys(top_df["symbol"].dropna().astype(str).tolist()))
+                )
+
+                buy_only_df = top_df[top_df["final_signal"] == "BUY SIGNAL"].copy()
+                almost_buy_only_df = top_df[top_df["final_signal"] == "ALMOST BUY"].copy()
+
+                buy_only_tickers = ", ".join(
+                    list(dict.fromkeys(buy_only_df["symbol"].dropna().astype(str).tolist()))
+                )
+
+                almost_buy_only_tickers = ", ".join(
+                    list(dict.fromkeys(almost_buy_only_df["symbol"].dropna().astype(str).tolist()))
+                )
+
+                st.subheader("Copyable Ticker Lists")
+
+                st.text_area(
+                    "All BUY SIGNAL + ALMOST BUY tickers",
+                    value=buy_almost_tickers,
+                    height=90,
+                    key=f"copy_all_buy_almost_tickers_{safe_universe_name}",
+                    help="Copy this list for your tracker, watchlist, or notes.",
+                )
+
+                col_buy_copy, col_almost_copy = st.columns(2)
+
+                with col_buy_copy:
+                    st.text_area(
+                        "BUY SIGNAL only",
+                        value=buy_only_tickers,
+                        height=90,
+                        key=f"copy_buy_only_tickers_{safe_universe_name}",
+                    )
+
+                with col_almost_copy:
+                    st.text_area(
+                        "ALMOST BUY only",
+                        value=almost_buy_only_tickers,
+                        height=90,
+                        key=f"copy_almost_buy_only_tickers_{safe_universe_name}",
+                    )
+
+                st.write("**Detailed BUY / ALMOST BUY results:**")
 
                 for _, row in top_df.iterrows():
                     st.write(
