@@ -1,17 +1,11 @@
 import os
-from io import StringIO
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
 
 from subscription_utils import (
     get_active_subscriptions,
@@ -19,40 +13,29 @@ from subscription_utils import (
     format_manage_link,
     get_secret,
 )
+from strategy_engine import (
+    scan_universe,
+    get_daily_bars_for_symbols,
+    prepare_indicators,
+    assess_sell_signal,
+    SIGNALS_TO_TRACK,
+    MARKET_FILTER_SYMBOL,
+    BROAD_BENCHMARK_SYMBOL,
+)
+from tracking_utils import (
+    record_new_signals,
+    get_open_signals,
+    update_signal,
+    get_signal_history,
+    rows_to_dataframe,
+    summarize_performance,
+)
 
 
 load_dotenv()
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-MARKET_FILTER_SYMBOL = "QQQ"
-
-LOOKBACK_DAYS = 260
-CROSS_LOOKBACK_DAYS = 3
-MAX_DISTANCE_ABOVE_MA20 = 1.20
-BOX_LOOKBACK_DAYS = 7
-WATCHLIST_MIN_BUY_SCORE = 4
-
-INDEX_UNIVERSES = {
-    "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-    "Nasdaq-100": "https://en.wikipedia.org/wiki/Nasdaq-100",
-    "Dow 30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
-    "S&P 400 MidCap": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
-}
-
-CHUNK_SIZE = 100
-
-
-# ============================================================
-# SECRETS
-# ============================================================
-
 ALPACA_API_KEY = get_secret("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = get_secret("ALPACA_SECRET_KEY")
-
 RESEND_API_KEY = get_secret("RESEND_API_KEY")
 RESEND_FROM_EMAIL = get_secret(
     "RESEND_FROM_EMAIL",
@@ -73,483 +56,339 @@ data_client = StockHistoricalDataClient(
 
 
 # ============================================================
-# UNIVERSE LISTS
+# RETURN CALCULATION
 # ============================================================
 
-def wiki_headers() -> dict:
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36 "
-            "DiffiesStockSignalScanner/1.0"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+def parse_date(value):
+    return pd.to_datetime(value).date()
 
 
-def read_wikipedia_tables(url: str) -> list[pd.DataFrame]:
-    response = requests.get(url, headers=wiki_headers(), timeout=30)
-    response.raise_for_status()
-    return pd.read_html(StringIO(response.text))
-
-
-def clean_symbol(symbol) -> str:
-    symbol = str(symbol).strip().upper()
-    symbol = symbol.replace("\xa0", "")
-    symbol = symbol.replace(" ", "")
-    symbol = symbol.replace("\n", "")
-    return symbol
-
-
-def first_table_with_columns(tables: list[pd.DataFrame], required_columns: list[str]) -> pd.DataFrame:
-    for table in tables:
-        columns = [str(c) for c in table.columns]
-        if all(col in columns for col in required_columns):
-            return table.copy()
-
-    raise RuntimeError(f"Could not find a table with columns: {required_columns}")
-
-
-def get_universe_symbols(universe_name: str) -> pd.DataFrame:
-    if universe_name not in INDEX_UNIVERSES:
-        raise RuntimeError(f"Unknown universe: {universe_name}")
-
-    tables = read_wikipedia_tables(INDEX_UNIVERSES[universe_name])
-
-    if universe_name == "S&P 500":
-        df = first_table_with_columns(tables, ["Symbol", "Security"])
-
-    elif universe_name == "Nasdaq-100":
-        df = first_table_with_columns(tables, ["Ticker", "Company"])
-        df = df.rename(columns={"Ticker": "Symbol", "Company": "Security"})
-
-    elif universe_name == "Dow 30":
-        df = first_table_with_columns(tables, ["Company", "Symbol"])
-        df = df.rename(
-            columns={
-                "Company": "Security",
-                "Sector": "GICS Sector",
-                "Industry": "GICS Sub-Industry",
-            }
-        )
-
-    elif universe_name == "S&P 400 MidCap":
-        df = first_table_with_columns(tables, ["Symbol", "Security"])
-
-    else:
-        raise RuntimeError(f"Unsupported universe: {universe_name}")
-
-    if "GICS Sector" not in df.columns:
-        if "Sector" in df.columns:
-            df["GICS Sector"] = df["Sector"]
-        else:
-            df["GICS Sector"] = "Unknown"
-
-    if "GICS Sub-Industry" not in df.columns:
-        if "Industry" in df.columns:
-            df["GICS Sub-Industry"] = df["Industry"]
-        else:
-            df["GICS Sub-Industry"] = "Unknown"
-
-    df = df[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].copy()
-
-    df["Symbol"] = df["Symbol"].apply(clean_symbol)
-    df["Security"] = df["Security"].astype(str)
-    df["GICS Sector"] = df["GICS Sector"].astype(str)
-    df["GICS Sub-Industry"] = df["GICS Sub-Industry"].astype(str)
-
-    df = df.dropna(subset=["Symbol"])
-    df = df[df["Symbol"] != ""]
-    df = df.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
-
-    return df
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-def get_daily_bars_for_symbols(symbols: list[str], days: int = LOOKBACK_DAYS) -> pd.DataFrame:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-
-    all_bars = []
-    last_error = None
-
-    for i in range(0, len(symbols), CHUNK_SIZE):
-        chunk = symbols[i:i + CHUNK_SIZE]
-        chunk_loaded = False
-
-        for feed in [DataFeed.SIP, DataFeed.IEX]:
-            try:
-                request = StockBarsRequest(
-                    symbol_or_symbols=chunk,
-                    timeframe=TimeFrame.Day,
-                    start=start,
-                    end=end,
-                    feed=feed,
-                )
-
-                bars = data_client.get_stock_bars(request).df
-
-                if bars.empty:
-                    continue
-
-                if isinstance(bars.index, pd.MultiIndex):
-                    bars = bars.reset_index()
-
-                bars = bars.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
-                all_bars.append(bars)
-                chunk_loaded = True
-                break
-
-            except Exception as e:
-                last_error = e
-
-        if not chunk_loaded:
-            print(f"Could not load chunk {i}-{i + CHUNK_SIZE}. Last error: {last_error}")
-
-    if not all_bars:
-        raise RuntimeError(f"No bars loaded. Last error: {last_error}")
-
-    return pd.concat(all_bars, ignore_index=True)
-
-
-def remove_unfinished_daily_candle(df: pd.DataFrame) -> pd.DataFrame:
+def trading_rows_after_signal(df: pd.DataFrame, signal_date) -> pd.DataFrame:
     if df.empty:
         return df
 
-    ny_time = datetime.now(ZoneInfo("America/New_York"))
-    latest_time = pd.to_datetime(df.iloc[-1]["timestamp"])
-    latest_date = latest_time.date()
-
-    if latest_date == ny_time.date() and ny_time.hour < 16:
-        return df.iloc[:-1].copy()
-
-    if latest_date == ny_time.date() and ny_time.hour == 16 and ny_time.minute < 10:
-        return df.iloc[:-1].copy()
-
-    return df
+    working = df.copy()
+    working["date_only"] = pd.to_datetime(working["timestamp"]).dt.date
+    return working[working["date_only"] > signal_date].copy().reset_index(drop=True)
 
 
-# ============================================================
-# INDICATORS
-# ============================================================
+def close_on_or_before(df: pd.DataFrame, target_date):
+    if df.empty:
+        return None
 
-def add_kdj(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
-    low_min = df["low"].rolling(period).min()
-    high_max = df["high"].rolling(period).max()
+    working = df.copy()
+    working["date_only"] = pd.to_datetime(working["timestamp"]).dt.date
+    before = working[working["date_only"] <= target_date].copy()
 
-    denominator = high_max - low_min
-    denominator = denominator.where(denominator != 0)
+    if before.empty:
+        return None
 
-    rsv = (df["close"] - low_min) / denominator * 100
-    rsv = rsv.fillna(50)
-
-    df["K"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
-    df["D"] = df["K"].ewm(alpha=1 / 3, adjust=False).mean()
-    df["J"] = 3 * df["K"] - 2 * df["D"]
-
-    return df
+    return float(before.iloc[-1]["close"])
 
 
-def add_macd(df: pd.DataFrame) -> pd.DataFrame:
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+def nday_return_from_signal(df: pd.DataFrame, signal_date, signal_close: float, n: int):
+    after = trading_rows_after_signal(df, signal_date)
+    if len(after) < n:
+        return None
 
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
-
-    return df
+    close_n = float(after.iloc[n - 1]["close"])
+    return (close_n / signal_close - 1) * 100
 
 
-def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
-    df["MA20"] = df["close"].rolling(20).mean()
-    return df
+def current_return_from_signal(df: pd.DataFrame, signal_close: float):
+    if df.empty:
+        return None, None
+    latest_close = float(df.iloc[-1]["close"])
+    return latest_close, (latest_close / signal_close - 1) * 100
 
 
-def add_box_theory_levels(df: pd.DataFrame) -> pd.DataFrame:
-    df["BOX_TOP"] = df["high"].shift(1).rolling(BOX_LOOKBACK_DAYS).max()
-    df["BOX_BOTTOM"] = df["low"].shift(1).rolling(BOX_LOOKBACK_DAYS).min()
-    return df
+def max_gain_drawdown(df: pd.DataFrame, signal_date, signal_close: float):
+    after = trading_rows_after_signal(df, signal_date)
+    if after.empty:
+        return None, None
+
+    closes = after["close"].astype(float)
+    max_gain = (closes.max() / signal_close - 1) * 100
+    max_drawdown = (closes.min() / signal_close - 1) * 100
+    return max_gain, max_drawdown
 
 
-def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = remove_unfinished_daily_candle(df)
-    df = add_kdj(df)
-    df = add_macd(df)
-    df = add_moving_averages(df)
-    df = add_box_theory_levels(df)
-    return df
+def benchmark_returns(benchmark_df: pd.DataFrame, signal_date, horizons: list[int]):
+    base_close = close_on_or_before(benchmark_df, signal_date)
+
+    result = {}
+    if base_close is None:
+        for n in horizons:
+            result[n] = None
+        return result
+
+    for n in horizons:
+        result[n] = nday_return_from_signal(benchmark_df, signal_date, base_close, n)
+
+    return result
 
 
-def cross_up(prev_a, prev_b, now_a, now_b) -> bool:
-    return prev_a <= prev_b and now_a > now_b
+def update_open_signal_performance() -> list[dict]:
+    open_signals = get_open_signals()
 
+    if not open_signals:
+        print("No open signals to update.")
+        return []
 
-def crossed_up_within_last_n_days(
-    df: pd.DataFrame,
-    col_a: str,
-    col_b: str,
-    n: int = CROSS_LOOKBACK_DAYS,
-) -> bool:
-    recent = df.iloc[-(n + 1):].copy()
+    symbols = sorted(set([s["ticker"] for s in open_signals] + [MARKET_FILTER_SYMBOL, BROAD_BENCHMARK_SYMBOL]))
+    all_bars = get_daily_bars_for_symbols(data_client, symbols)
 
-    for i in range(1, len(recent)):
-        prev = recent.iloc[i - 1]
-        now = recent.iloc[i]
-
-        if cross_up(prev[col_a], prev[col_b], now[col_a], now[col_b]):
-            return True
-
-    return False
-
-
-def scan_one_symbol(
-    symbol: str,
-    company_name: str,
-    sector: str,
-    sub_industry: str,
-    df: pd.DataFrame,
-    qqq_above_ma20: bool,
-) -> dict:
-    df = df.copy()
-    df = prepare_indicators(df)
-
-    if len(df) < max(50, BOX_LOOKBACK_DAYS + 10):
-        return {
-            "symbol": symbol,
-            "company_name": company_name,
-            "sector": sector,
-            "sub_industry": sub_industry,
-            "final_signal": "ERROR",
-            "error": "Not enough data",
-        }
-
-    latest = df.iloc[-1]
-
-    latest_close = float(latest["close"])
-    ma20 = float(latest["MA20"])
-
-    box_top = latest["BOX_TOP"]
-    box_bottom = latest["BOX_BOTTOM"]
-
-    if pd.isna(box_top) or pd.isna(box_bottom):
-        return {
-            "symbol": symbol,
-            "company_name": company_name,
-            "sector": sector,
-            "sub_industry": sub_industry,
-            "final_signal": "ERROR",
-            "error": "Not enough Box Theory data",
-        }
-
-    box_top = float(box_top)
-    box_bottom = float(box_bottom)
-
-    kdj_cross_recent = crossed_up_within_last_n_days(df, "K", "D")
-    macd_cross_recent = crossed_up_within_last_n_days(df, "MACD", "MACD_SIGNAL")
-    stock_above_ma20 = latest_close > ma20
-    not_too_extended = latest_close <= ma20 * MAX_DISTANCE_ABOVE_MA20
-    box_breakout = latest_close > box_top
-
-    buy_checks = {
-        "KDJ recent golden cross": kdj_cross_recent,
-        "MACD recent golden cross": macd_cross_recent,
-        "Close > MA20": stock_above_ma20,
-        "QQQ > QQQ MA20": qqq_above_ma20,
-        f"Close <= MA20 * {MAX_DISTANCE_ABOVE_MA20}": not_too_extended,
-        f"Close > previous {BOX_LOOKBACK_DAYS}-day box top": box_breakout,
-    }
-
-    buy_score = sum(1 for value in buy_checks.values() if value)
-    buy_total = len(buy_checks)
-
-    safety_filters_pass = stock_above_ma20 and qqq_above_ma20 and not_too_extended
-
-    failed_checks = [
-        check_name
-        for check_name, passed in buy_checks.items()
-        if not passed
-    ]
-
-    if buy_score == buy_total:
-        final_signal = "BUY SIGNAL"
-    elif buy_score == buy_total - 1 and safety_filters_pass:
-        final_signal = "ALMOST BUY"
-    elif buy_score >= WATCHLIST_MIN_BUY_SCORE and safety_filters_pass:
-        final_signal = "WATCHLIST"
-    else:
-        final_signal = "NO ACTION"
-
-    distance_from_ma20_pct = (latest_close / ma20 - 1) * 100
-
-    return {
-        "symbol": symbol,
-        "company_name": company_name,
-        "sector": sector,
-        "sub_industry": sub_industry,
-        "final_signal": final_signal,
-        "latest_date": str(latest["timestamp"]),
-        "latest_close": round(latest_close, 2),
-        "ma20": round(ma20, 2),
-        "distance_from_ma20_pct": round(distance_from_ma20_pct, 2),
-        "box_top": round(box_top, 2),
-        "box_bottom": round(box_bottom, 2),
-        "buy_score": buy_score,
-        "buy_total": buy_total,
-        "failed_checks": "; ".join(failed_checks),
-    }
-
-
-def scan_universe(universe_name: str) -> tuple[pd.DataFrame, dict]:
-    universe = get_universe_symbols(universe_name)
-    symbols = universe["Symbol"].tolist()
-    symbols_to_download = sorted(set(symbols + [MARKET_FILTER_SYMBOL]))
-
-    all_bars = get_daily_bars_for_symbols(symbols_to_download)
-
-    qqq_df = all_bars[all_bars["symbol"] == MARKET_FILTER_SYMBOL].copy()
-    qqq_df = prepare_indicators(qqq_df)
-
-    if len(qqq_df) < 50:
-        raise RuntimeError("Not enough QQQ data.")
-
-    qqq_latest = qqq_df.iloc[-1]
-    qqq_close = float(qqq_latest["close"])
-    qqq_ma20 = float(qqq_latest["MA20"])
-    qqq_above_ma20 = qqq_close > qqq_ma20
-
-    market_info = {
-        "universe_name": universe_name,
-        "universe_count": len(universe),
-        "qqq_close": round(qqq_close, 2),
-        "qqq_ma20": round(qqq_ma20, 2),
-        "qqq_above_ma20": qqq_above_ma20,
-        "qqq_latest_date": str(qqq_latest["timestamp"]),
-    }
-
-    results = []
-
-    for _, row in universe.iterrows():
-        symbol = row["Symbol"]
-        company_name = row["Security"]
-        sector = row["GICS Sector"]
-        sub_industry = row["GICS Sub-Industry"]
-
+    prepared_by_symbol = {}
+    for symbol in symbols:
         symbol_df = all_bars[all_bars["symbol"] == symbol].copy()
+        if not symbol_df.empty:
+            prepared_by_symbol[symbol] = prepare_indicators(symbol_df)
+
+    qqq_df = prepared_by_symbol.get(MARKET_FILTER_SYMBOL, pd.DataFrame())
+    spy_df = prepared_by_symbol.get(BROAD_BENCHMARK_SYMBOL, pd.DataFrame())
+
+    sell_notices = []
+    horizons = [1, 3, 5, 10, 20, 60]
+
+    for signal in open_signals:
+        signal_id = signal["id"]
+        ticker = signal["ticker"]
+        signal_date = parse_date(signal["signal_date"])
+        signal_close = float(signal["signal_close"])
+        symbol_df = prepared_by_symbol.get(ticker, pd.DataFrame())
 
         if symbol_df.empty:
-            results.append({
-                "symbol": symbol,
-                "company_name": company_name,
-                "sector": sector,
-                "sub_industry": sub_industry,
-                "final_signal": "ERROR",
-                "error": "No bars returned from Alpaca",
-            })
             continue
 
-        result = scan_one_symbol(
-            symbol=symbol,
-            company_name=company_name,
-            sector=sector,
-            sub_industry=sub_industry,
-            df=symbol_df,
-            qqq_above_ma20=qqq_above_ma20,
-        )
+        latest_close, current_return = current_return_from_signal(symbol_df, signal_close)
+        max_gain, max_drawdown = max_gain_drawdown(symbol_df, signal_date, signal_close)
 
-        results.append(result)
+        returns = {}
+        for n in horizons:
+            returns[f"return_{n}d"] = nday_return_from_signal(symbol_df, signal_date, signal_close, n)
 
-    return pd.DataFrame(results), market_info
+        qqq_returns = benchmark_returns(qqq_df, signal_date, horizons)
+        spy_returns = benchmark_returns(spy_df, signal_date, horizons)
+
+        payload = {
+            "current_close": latest_close,
+            "current_return_pct": current_return,
+            "max_gain_since_signal": max_gain,
+            "max_drawdown_since_signal": max_drawdown,
+        }
+
+        for n in horizons:
+            payload[f"return_{n}d"] = returns[f"return_{n}d"]
+            payload[f"qqq_return_{n}d"] = qqq_returns[n]
+            payload[f"spy_return_{n}d"] = spy_returns[n]
+
+            if returns[f"return_{n}d"] is not None and qqq_returns[n] is not None:
+                payload[f"excess_vs_qqq_{n}d"] = returns[f"return_{n}d"] - qqq_returns[n]
+                payload[f"beat_qqq_{n}d"] = returns[f"return_{n}d"] > qqq_returns[n]
+
+            if returns[f"return_{n}d"] is not None and spy_returns[n] is not None:
+                payload[f"excess_vs_spy_{n}d"] = returns[f"return_{n}d"] - spy_returns[n]
+                payload[f"beat_spy_{n}d"] = returns[f"return_{n}d"] > spy_returns[n]
+
+        sell = assess_sell_signal(symbol_df, signal_close)
+        current_sell_type = sell.get("sell_signal_type", "UNKNOWN")
+
+        payload.update({
+            "current_sell_signal_type": current_sell_type,
+            "latest_sell_check_date": parse_date(sell.get("latest_date")).isoformat() if sell.get("latest_date") else None,
+            "exit_reason": sell.get("exit_reason"),
+        })
+
+        previous_notice_type = signal.get("last_notice_sell_signal_type")
+        should_notice = False
+
+        if current_sell_type in ["SELL SIGNAL", "ALMOST SELL", "CAUTION HOLD"]:
+            if current_sell_type != previous_notice_type:
+                should_notice = True
+                payload["last_notice_sell_signal_type"] = current_sell_type
+                payload["last_notice_sent_at"] = datetime.now(timezone.utc).isoformat()
+
+        if current_sell_type == "CAUTION HOLD" and not signal.get("first_caution_hold_date"):
+            payload["first_caution_hold_date"] = parse_date(sell.get("latest_date")).isoformat()
+
+        if current_sell_type == "ALMOST SELL" and not signal.get("first_almost_sell_date"):
+            payload["first_almost_sell_date"] = parse_date(sell.get("latest_date")).isoformat()
+
+        if current_sell_type == "SELL SIGNAL":
+            sell_date = parse_date(sell.get("latest_date"))
+            sell_price = float(sell.get("sell_signal_price"))
+            return_to_sell = (sell_price / signal_close - 1) * 100
+            days_to_sell = len(trading_rows_after_signal(symbol_df, signal_date))
+
+            payload.update({
+                "sell_signal_type": current_sell_type,
+                "sell_signal_date": sell_date.isoformat(),
+                "sell_signal_price": sell_price,
+                "return_to_sell_signal_pct": return_to_sell,
+                "days_to_sell_signal": days_to_sell,
+                "status": sell.get("status", "CLOSED_BY_SELL_SIGNAL"),
+            })
+        else:
+            payload["status"] = sell.get("status", "OPEN")
+
+            # Expire after 60 trading days if no sell signal appeared.
+            after = trading_rows_after_signal(symbol_df, signal_date)
+            if len(after) >= 60 and payload["status"] in ["OPEN", "OPEN_WITH_CAUTION", "OPEN_WITH_ALMOST_SELL"]:
+                payload["status"] = "EXPIRED_60D"
+
+        updated = update_signal(signal_id, payload)
+
+        if should_notice and updated:
+            sell_notices.append(updated)
+
+    return sell_notices
 
 
 # ============================================================
-# EMAIL
+# EMAIL HTML
 # ============================================================
 
-def build_universe_section_html(universe_name: str, results_df: pd.DataFrame) -> str:
-    top_df = results_df[
-        results_df["final_signal"].isin(["BUY SIGNAL", "ALMOST BUY"])
-    ].copy()
+def build_signal_table_html(title: str, rows: list[dict]) -> str:
+    if not rows:
+        return f"<h3>{title}</h3><p>None today.</p>"
 
-    if top_df.empty:
-        return f"""
-        <h3>{universe_name}</h3>
-        <p>No BUY SIGNAL or ALMOST BUY stocks right now.</p>
-        """
-
-    top_df = top_df.sort_values(
-        ["final_signal", "buy_score", "distance_from_ma20_pct"],
-        ascending=[True, False, True],
-    )
-
-    rows_html = ""
-
-    for _, row in top_df.iterrows():
-        rows_html += f"""
+    body = ""
+    for row in rows:
+        body += f"""
         <tr>
-            <td><strong>{row.get('symbol', '')}</strong></td>
+            <td><strong>{row.get('ticker') or row.get('symbol')}</strong></td>
             <td>{row.get('company_name', '')}</td>
-            <td>{row.get('final_signal', '')}</td>
+            <td>{row.get('signal_type') or row.get('final_signal', '')}</td>
+            <td>{row.get('universe', '')}</td>
+            <td>{row.get('signal_close') or row.get('latest_close', '')}</td>
             <td>{row.get('buy_score', '')}/{row.get('buy_total', '')}</td>
-            <td>{row.get('latest_close', '')}</td>
             <td>{row.get('failed_checks', '')}</td>
         </tr>
         """
 
     return f"""
-    <h3>{universe_name}</h3>
+    <h3>{title}</h3>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
-        <thead>
-            <tr>
-                <th>Symbol</th>
-                <th>Company</th>
-                <th>Signal</th>
-                <th>Score</th>
-                <th>Close</th>
-                <th>Missing checks</th>
-            </tr>
-        </thead>
-        <tbody>
-            {rows_html}
-        </tbody>
+      <thead>
+        <tr>
+          <th>Ticker</th><th>Company</th><th>Signal</th><th>Universe</th>
+          <th>Signal Close</th><th>Score</th><th>Missing Checks</th>
+        </tr>
+      </thead>
+      <tbody>{body}</tbody>
     </table>
     """
 
 
-def build_email_html(subscription: dict, universe_results: dict[str, pd.DataFrame]) -> str:
-    selected_universes = selected_universes_from_subscription(subscription)
+def build_sell_notice_html(rows: list[dict]) -> str:
+    if not rows:
+        return "<h3>Sell / Caution Notices</h3><p>No new sell notices today.</p>"
 
+    body = ""
+    for row in rows:
+        body += f"""
+        <tr>
+            <td><strong>{row.get('ticker')}</strong></td>
+            <td>{row.get('company_name', '')}</td>
+            <td>{row.get('current_sell_signal_type', '')}</td>
+            <td>{row.get('signal_date', '')}</td>
+            <td>{row.get('signal_close', '')}</td>
+            <td>{row.get('current_close', '')}</td>
+            <td>{round(float(row.get('current_return_pct') or 0), 2)}%</td>
+            <td>{row.get('exit_reason', '')}</td>
+        </tr>
+        """
+
+    return f"""
+    <h3>Sell / Caution Notices</h3>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th>Ticker</th><th>Company</th><th>Notice</th><th>Buy Signal Date</th>
+          <th>Signal Close</th><th>Current Close</th><th>Return</th><th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>{body}</tbody>
+    </table>
+    """
+
+
+def build_performance_summary_html() -> str:
+    rows = get_signal_history(limit=2000)
+    df = rows_to_dataframe(rows)
+    summary_df = summarize_performance(df)
+
+    if summary_df.empty:
+        return "<h3>Strategy Performance Snapshot</h3><p>Not enough tracked signals yet.</p>"
+
+    body = ""
+    for _, row in summary_df.iterrows():
+        body += f"""
+        <tr>
+            <td>{row.get('signal_type', '')}</td>
+            <td>{int(row.get('total_signals') or 0)}</td>
+            <td>{round(float(row.get('avg_current_return_pct') or 0), 2)}%</td>
+            <td>{round(float(row.get('avg_5d_return_pct') or 0), 2)}%</td>
+            <td>{round(float(row.get('win_rate_5d_pct') or 0), 2)}%</td>
+            <td>{round(float(row.get('beat_qqq_5d_pct') or 0), 2)}%</td>
+        </tr>
+        """
+
+    return f"""
+    <h3>Strategy Performance Snapshot</h3>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th>Signal Type</th><th>Total</th><th>Avg Current Return</th>
+          <th>Avg 5D Return</th><th>5D Win Rate</th><th>5D Beat QQQ Rate</th>
+        </tr>
+      </thead>
+      <tbody>{body}</tbody>
+    </table>
+    """
+
+
+def build_email_html(subscription: dict, new_signals_by_universe: dict[str, list[dict]], sell_notices: list[dict]) -> str:
+    selected_universes = selected_universes_from_subscription(subscription)
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     manage_link = format_manage_link(subscription["token"])
 
-    sections = ""
+    high_rows = []
+    buy_rows = []
+    almost_rows = []
 
     for universe_name in selected_universes:
-        results_df = universe_results.get(universe_name)
+        for row in new_signals_by_universe.get(universe_name, []):
+            if row.get("signal_type") == "HIGH CONVICTION BUY":
+                high_rows.append(row)
+            elif row.get("signal_type") == "BUY SIGNAL":
+                buy_rows.append(row)
+            elif row.get("signal_type") == "ALMOST BUY":
+                almost_rows.append(row)
 
-        if results_df is None:
-            sections += f"<h3>{universe_name}</h3><p>Could not scan this list today.</p>"
-        else:
-            sections += build_universe_section_html(universe_name, results_df)
+    filtered_sell_notices = [
+        row for row in sell_notices
+        if row.get("universe") in selected_universes
+    ]
 
     return f"""
     <div style="font-family: Arial, sans-serif; line-height: 1.5;">
         <h2>Diffie's Daily Stock Signal Update — {today}</h2>
 
         <p>
-            This email lists <strong>BUY SIGNAL</strong> and <strong>ALMOST BUY</strong>
-            stocks based on Diffie's KDJ + MACD + MA20 + QQQ + 7-day Box Theory strategy.
+            This email lists new BUY / ALMOST BUY signals and sell/caution notices
+            based on Diffie's daily KDJ + MACD + MA20 + QQQ + 7-day Box Theory strategy.
         </p>
 
         <p>
             This is for manual decision support only. It does not place trades and does not guarantee profit.
         </p>
 
-        {sections}
+        {build_signal_table_html('High Conviction BUY', high_rows)}
+        {build_signal_table_html('BUY SIGNAL', buy_rows)}
+        {build_signal_table_html('ALMOST BUY', almost_rows)}
+        {build_sell_notice_html(filtered_sell_notices)}
+        {build_performance_summary_html()}
 
         <hr>
 
@@ -590,29 +429,35 @@ def main():
 
     if not subscribers:
         print("No active subscribers.")
+        # Still update open signals, so tracking keeps working.
+        update_open_signal_performance()
         return
 
     print(f"Active subscribers: {len(subscribers)}")
 
     needed_universes = set()
-
     for subscriber in subscribers:
         for universe_name in selected_universes_from_subscription(subscriber):
             needed_universes.add(universe_name)
 
-    universe_results = {}
+    new_signals_by_universe = {}
 
     for universe_name in sorted(needed_universes):
         print(f"Scanning {universe_name}...")
-        results_df, market_info = scan_universe(universe_name)
-        universe_results[universe_name] = results_df
-        print(f"Finished {universe_name}: {len(results_df)} rows")
+        results_df, market_info, _prepared = scan_universe(data_client, universe_name)
+        saved_rows = record_new_signals(results_df, universe_name)
+        new_signals_by_universe[universe_name] = saved_rows
+        print(f"Finished {universe_name}: {len(results_df)} rows, saved {len(saved_rows)} new tracked signals")
+
+    print("Updating open signal performance and sell notices...")
+    sell_notices = update_open_signal_performance()
+    print(f"Sell/caution notices: {len(sell_notices)}")
 
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
     for subscriber in subscribers:
         email = subscriber["email"]
-        html = build_email_html(subscriber, universe_results)
+        html = build_email_html(subscriber, new_signals_by_universe, sell_notices)
         subject = f"Diffie's Daily Stock Signals — {today}"
 
         print(f"Sending email to {email}...")

@@ -1,4 +1,5 @@
 import os
+import re
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -24,7 +25,6 @@ from subscription_utils import (
     unsubscribe_by_email,
     format_manage_link,
 )
-
 
 # ============================================================
 # PAGE CONFIG
@@ -53,6 +53,16 @@ BOX_LOOKBACK_DAYS = 7
 
 # There are 6 buy checks total after Box Theory is included.
 WATCHLIST_MIN_BUY_SCORE = 4
+
+# Extra confirmations used to label HIGH CONVICTION BUY.
+VOLUME_CONFIRMATION_MULTIPLE = 1.20
+
+UNIVERSE_BENCHMARKS = {
+    "S&P 500": "SPY",
+    "Nasdaq-100": "QQQ",
+    "Dow 30": "DIA",
+    "S&P 400 MidCap": "MDY",
+}
 
 INDEX_UNIVERSES = {
     "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -255,6 +265,8 @@ def add_macd(df: pd.DataFrame) -> pd.DataFrame:
 def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     df["MA10"] = df["close"].rolling(10).mean()
     df["MA20"] = df["close"].rolling(20).mean()
+    df["VOL20"] = df["volume"].rolling(20).mean()
+    df["RET20"] = df["close"] / df["close"].shift(20) - 1
     return df
 
 
@@ -332,8 +344,10 @@ def three_consecutive_down_closes(df: pd.DataFrame) -> bool:
 
 
 def suggested_action(signal: str) -> str:
+    if signal == "HIGH CONVICTION BUY":
+        return "Strongest setup. Base buy signal plus volume, relative strength, and benchmark confirmation passed."
     if signal == "BUY SIGNAL":
-        return "Best setup. Consider manual buy next trading day around 9:45 AM ET using a limit order."
+        return "Best base setup. Consider manual review next trading day around 9:45 AM ET using a limit order."
     if signal == "ALMOST BUY":
         return "Very close setup. Consider waiting for the missing condition to confirm."
     if signal == "WATCHLIST":
@@ -772,6 +786,7 @@ def scan_one_stock(symbol: str, entry_price):
     qqq_close = float(qqq_latest["close"])
     qqq_ma20 = float(qqq_latest["MA20"])
     qqq_above_ma20 = qqq_close > qqq_ma20
+    qqq_ret20 = float(qqq_latest["RET20"]) if pd.notna(qqq_latest.get("RET20")) else None
 
     holding = entry_price is not None
 
@@ -782,6 +797,14 @@ def scan_one_stock(symbol: str, entry_price):
 
     box_breakout = latest_close > box_top
     box_breakdown = latest_close < box_bottom
+
+    volume_value = float(latest["volume"]) if pd.notna(latest.get("volume")) else 0.0
+    vol20 = float(latest["VOL20"]) if pd.notna(latest.get("VOL20")) else None
+    volume_confirmed = bool(vol20 and vol20 > 0 and volume_value >= vol20 * VOLUME_CONFIRMATION_MULTIPLE)
+
+    stock_ret20 = float(latest["RET20"]) if pd.notna(latest.get("RET20")) else None
+    relative_strength_confirmed = bool(stock_ret20 is not None and qqq_ret20 is not None and stock_ret20 > qqq_ret20)
+    universe_benchmark_confirmed = qqq_above_ma20
 
     buy_checks = {
         "KDJ golden cross within last 3 completed daily candles": kdj_cross_recent,
@@ -821,6 +844,13 @@ def scan_one_stock(symbol: str, entry_price):
 
     stock_safety_filters_pass = stock_above_ma20 and qqq_above_ma20 and not_too_extended
 
+    high_conviction_buy = (
+        buy_score == buy_total
+        and volume_confirmed
+        and relative_strength_confirmed
+        and universe_benchmark_confirmed
+    )
+
     if holding:
         if hard_sell_signal or medium_sell_signal:
             final_signal = "SELL SIGNAL"
@@ -829,7 +859,9 @@ def scan_one_stock(symbol: str, entry_price):
         else:
             final_signal = "HOLD"
     else:
-        if buy_score == buy_total:
+        if high_conviction_buy:
+            final_signal = "HIGH CONVICTION BUY"
+        elif buy_score == buy_total:
             final_signal = "BUY SIGNAL"
         elif buy_score == buy_total - 1 and stock_safety_filters_pass:
             final_signal = "ALMOST BUY"
@@ -868,6 +900,14 @@ def scan_one_stock(symbol: str, entry_price):
         "hard_sell_signal": hard_sell_signal,
         "medium_sell_signal": medium_sell_signal,
         "stop_loss_price": stop_loss_price,
+        "volume": volume_value,
+        "vol20": vol20,
+        "volume_confirmed": volume_confirmed,
+        "stock_ret20": stock_ret20,
+        "qqq_ret20": qqq_ret20,
+        "relative_strength_confirmed": relative_strength_confirmed,
+        "universe_benchmark_confirmed": universe_benchmark_confirmed,
+        "high_conviction_buy": high_conviction_buy,
         "stock_df": stock_df,
     }
 
@@ -990,6 +1030,8 @@ def scan_one_index_symbol(
     sub_industry: str,
     df: pd.DataFrame,
     qqq_above_ma20: bool,
+    qqq_ret20: float | None,
+    universe_benchmark_above_ma20: bool,
 ) -> dict:
     df = df.copy()
     df = prepare_indicators(df)
@@ -1031,6 +1073,13 @@ def scan_one_index_symbol(
     not_too_extended = latest_close <= ma20 * MAX_DISTANCE_ABOVE_MA20
     box_breakout = latest_close > box_top
 
+    volume_value = float(latest["volume"]) if pd.notna(latest.get("volume")) else 0.0
+    vol20 = float(latest["VOL20"]) if pd.notna(latest.get("VOL20")) else None
+    volume_confirmed = bool(vol20 and vol20 > 0 and volume_value >= vol20 * VOLUME_CONFIRMATION_MULTIPLE)
+
+    stock_ret20 = float(latest["RET20"]) if pd.notna(latest.get("RET20")) else None
+    relative_strength_confirmed = bool(stock_ret20 is not None and qqq_ret20 is not None and stock_ret20 > qqq_ret20)
+
     buy_checks = {
         "KDJ recent golden cross": kdj_cross_recent,
         "MACD recent golden cross": macd_cross_recent,
@@ -1051,7 +1100,16 @@ def scan_one_index_symbol(
         if not passed
     ]
 
-    if buy_score == buy_total:
+    high_conviction_buy = (
+        buy_score == buy_total
+        and volume_confirmed
+        and relative_strength_confirmed
+        and universe_benchmark_above_ma20
+    )
+
+    if high_conviction_buy:
+        final_signal = "HIGH CONVICTION BUY"
+    elif buy_score == buy_total:
         final_signal = "BUY SIGNAL"
     elif buy_score == buy_total - 1 and safety_filters_pass:
         final_signal = "ALMOST BUY"
@@ -1083,6 +1141,14 @@ def scan_one_index_symbol(
         "qqq_above_ma20": qqq_above_ma20,
         "not_too_extended": not_too_extended,
         "box_breakout": box_breakout,
+        "volume": round(volume_value, 2),
+        "vol20": round(vol20, 2) if vol20 is not None else None,
+        "volume_confirmed": volume_confirmed,
+        "stock_ret20": round(stock_ret20 * 100, 2) if stock_ret20 is not None else None,
+        "qqq_ret20": round(qqq_ret20 * 100, 2) if qqq_ret20 is not None else None,
+        "relative_strength_confirmed": relative_strength_confirmed,
+        "universe_benchmark_confirmed": universe_benchmark_above_ma20,
+        "high_conviction_buy": high_conviction_buy,
     }
 
 
@@ -1091,7 +1157,8 @@ def scan_universe_cached(universe_name: str) -> tuple[pd.DataFrame, dict]:
     universe_df = get_universe_symbols(universe_name)
     symbols = universe_df["Symbol"].tolist()
 
-    symbols_to_download = sorted(set(symbols + [MARKET_FILTER_SYMBOL]))
+    benchmark_symbol = UNIVERSE_BENCHMARKS.get(universe_name, MARKET_FILTER_SYMBOL)
+    symbols_to_download = sorted(set(symbols + [MARKET_FILTER_SYMBOL, benchmark_symbol, "SPY"]))
     all_bars = get_daily_bars_for_symbols(symbols_to_download)
 
     qqq_df = all_bars[all_bars["symbol"] == MARKET_FILTER_SYMBOL].copy()
@@ -1104,6 +1171,14 @@ def scan_universe_cached(universe_name: str) -> tuple[pd.DataFrame, dict]:
     qqq_close = float(qqq_latest["close"])
     qqq_ma20 = float(qqq_latest["MA20"])
     qqq_above_ma20 = qqq_close > qqq_ma20
+    qqq_ret20 = float(qqq_latest["RET20"]) if pd.notna(qqq_latest.get("RET20")) else None
+
+    benchmark_df = all_bars[all_bars["symbol"] == benchmark_symbol].copy()
+    benchmark_df = prepare_indicators(benchmark_df) if not benchmark_df.empty else qqq_df.copy()
+    benchmark_latest = benchmark_df.iloc[-1]
+    benchmark_close = float(benchmark_latest["close"])
+    benchmark_ma20 = float(benchmark_latest["MA20"])
+    universe_benchmark_above_ma20 = benchmark_close > benchmark_ma20
 
     market_info = {
         "universe_name": universe_name,
@@ -1112,6 +1187,11 @@ def scan_universe_cached(universe_name: str) -> tuple[pd.DataFrame, dict]:
         "qqq_ma20": round(qqq_ma20, 2),
         "qqq_above_ma20": qqq_above_ma20,
         "qqq_latest_date": str(qqq_latest["timestamp"]),
+        "qqq_ret20": round(qqq_ret20 * 100, 2) if qqq_ret20 is not None else None,
+        "benchmark_symbol": benchmark_symbol,
+        "benchmark_close": round(benchmark_close, 2),
+        "benchmark_ma20": round(benchmark_ma20, 2),
+        "universe_benchmark_above_ma20": universe_benchmark_above_ma20,
     }
 
     results = []
@@ -1142,6 +1222,8 @@ def scan_universe_cached(universe_name: str) -> tuple[pd.DataFrame, dict]:
             sub_industry=sub_industry,
             df=symbol_df,
             qqq_above_ma20=qqq_above_ma20,
+            qqq_ret20=qqq_ret20,
+            universe_benchmark_above_ma20=universe_benchmark_above_ma20,
         )
 
         results.append(result)
@@ -1237,7 +1319,9 @@ def show_signal_card(result: dict):
     signal = result["final_signal"]
     symbol = result["symbol"]
 
-    if signal == "BUY SIGNAL":
+    if signal == "HIGH CONVICTION BUY":
+        st.success(f"🔥 {symbol}: HIGH CONVICTION BUY")
+    elif signal == "BUY SIGNAL":
         st.success(f"🚀 {symbol}: BUY SIGNAL")
     elif signal == "ALMOST BUY":
         st.warning(f"🟡 {symbol}: ALMOST BUY")
@@ -1362,6 +1446,277 @@ def show_fundamentals(symbol: str):
         st.warning(f"Could not load SEC fundamentals for {symbol}: {e}")
 
 
+
+
+# ============================================================
+# MANUAL PERFORMANCE / SELL TRACKER HELPERS
+# ============================================================
+
+def parse_ticker_list(raw_text: str) -> list[str]:
+    """
+    Accepts tickers copied from the scanner, for example:
+    TSLA, AAPL, NVDA
+    or one ticker per line.
+    """
+    raw_text = raw_text or ""
+    pieces = re.split(r"[,;\s]+", raw_text.upper().strip())
+
+    tickers = []
+    for item in pieces:
+        item = item.strip()
+        if not item:
+            continue
+        item = item.replace("$", "")
+        if item not in tickers:
+            tickers.append(item)
+
+    return tickers
+
+
+def date_only_from_timestamp(value):
+    return pd.to_datetime(value).date()
+
+
+def find_signal_candle_on_or_before(df: pd.DataFrame, selected_date) -> pd.Series | None:
+    """
+    Finds the completed daily candle on or before the user-input signal date.
+    This handles weekends/holidays by using the most recent trading day before that date.
+    """
+    if df.empty:
+        return None
+
+    working = df.copy()
+    working["date_only"] = pd.to_datetime(working["timestamp"]).dt.date
+    eligible = working[working["date_only"] <= selected_date].copy()
+
+    if eligible.empty:
+        return None
+
+    return eligible.iloc[-1]
+
+
+def trading_rows_after_date(df: pd.DataFrame, signal_date) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    working = df.copy()
+    working["date_only"] = pd.to_datetime(working["timestamp"]).dt.date
+    return working[working["date_only"] > signal_date].copy().reset_index(drop=True)
+
+
+def n_trading_day_return(df: pd.DataFrame, signal_date, signal_close: float, n: int):
+    after = trading_rows_after_date(df, signal_date)
+
+    if len(after) < n:
+        return None
+
+    close_n = float(after.iloc[n - 1]["close"])
+    return (close_n / signal_close - 1) * 100
+
+
+def return_since_signal(current_close: float, signal_close: float):
+    if signal_close is None or signal_close == 0:
+        return None
+
+    return (current_close / signal_close - 1) * 100
+
+
+def assess_manual_sell_signal(df: pd.DataFrame, signal_close: float) -> dict:
+    """
+    Current sell-status logic for a manually tracked ticker list.
+
+    SELL SIGNAL:
+    - Stop loss hit, or
+    - Box breakdown, or
+    - 2+ medium warnings
+
+    ALMOST SELL:
+    - 1 medium warning AND price is near MA10 or below box mid
+
+    CAUTION HOLD:
+    - 1 medium warning, but structure is not weak enough for Almost Sell
+
+    HOLD:
+    - no warning
+    """
+    df = prepare_indicators(df)
+
+    if len(df) < max(50, BOX_LOOKBACK_DAYS + 10):
+        return {
+            "sell_signal_type": "UNKNOWN",
+            "sell_notice_date": "",
+            "exit_reason": "Not enough data",
+        }
+
+    latest = df.iloc[-1]
+    latest_close = float(latest["close"])
+    latest_date = date_only_from_timestamp(latest["timestamp"])
+
+    ma10 = float(latest["MA10"])
+    box_bottom = float(latest["BOX_BOTTOM"])
+    box_mid = float(latest["BOX_MID"])
+
+    stop_loss_hit = latest_close <= float(signal_close) * (1 - STOP_LOSS_PCT)
+    box_breakdown = latest_close < box_bottom
+    macd_cross_down = crossed_down_today(df, "MACD", "MACD_SIGNAL")
+    close_below_ma10 = latest_close < ma10
+    three_down_days = three_consecutive_down_closes(df)
+
+    medium_warnings = {
+        "MACD crossed down": macd_cross_down,
+        "Close < MA10": close_below_ma10,
+        "Three consecutive down closes": three_down_days,
+    }
+
+    medium_warning_count = sum(1 for value in medium_warnings.values() if value)
+    medium_reasons = [name for name, value in medium_warnings.items() if value]
+
+    if stop_loss_hit:
+        sell_signal_type = "SELL SIGNAL"
+        exit_reason = "Stop loss hit"
+    elif box_breakdown:
+        sell_signal_type = "SELL SIGNAL"
+        exit_reason = "Box breakdown"
+    elif medium_warning_count >= 2:
+        sell_signal_type = "SELL SIGNAL"
+        exit_reason = "; ".join(medium_reasons)
+    elif medium_warning_count == 1:
+        near_ma10 = latest_close <= ma10 * 1.02
+        weak_structure = latest_close < box_mid
+
+        if near_ma10 or weak_structure:
+            sell_signal_type = "ALMOST SELL"
+            exit_reason = "; ".join(medium_reasons)
+        else:
+            sell_signal_type = "CAUTION HOLD"
+            exit_reason = "; ".join(medium_reasons)
+    else:
+        sell_signal_type = "HOLD"
+        exit_reason = "No sell warning"
+
+    sell_notice_date = str(latest_date) if sell_signal_type in ["SELL SIGNAL", "ALMOST SELL", "CAUTION HOLD"] else ""
+
+    return {
+        "sell_signal_type": sell_signal_type,
+        "sell_notice_date": sell_notice_date,
+        "latest_date": str(latest_date),
+        "latest_close": round(latest_close, 2),
+        "sell_signal_price": round(latest_close, 2) if sell_signal_type == "SELL SIGNAL" else None,
+        "ma10": round(ma10, 2),
+        "box_bottom": round(box_bottom, 2),
+        "box_mid": round(box_mid, 2),
+        "stop_loss_hit": stop_loss_hit,
+        "box_breakdown": box_breakdown,
+        "macd_cross_down": macd_cross_down,
+        "close_below_ma10": close_below_ma10,
+        "three_down_days": three_down_days,
+        "medium_warning_count": medium_warning_count,
+        "exit_reason": exit_reason,
+    }
+
+
+def build_manual_tracker_row(symbol: str, signal_date_input, original_signal_type: str) -> dict:
+    symbol = symbol.strip().upper()
+
+    days_needed = max(
+        LOOKBACK_DAYS,
+        (datetime.now().date() - signal_date_input).days + 90,
+    )
+
+    df = get_daily_bars(symbol, days=days_needed)
+    df = prepare_indicators(df)
+
+    signal_row = find_signal_candle_on_or_before(df, signal_date_input)
+
+    if signal_row is None:
+        return {
+            "ticker": symbol,
+            "original_signal_type": original_signal_type,
+            "error": "No candle found on or before selected signal date.",
+        }
+
+    latest = df.iloc[-1]
+
+    signal_date_used = date_only_from_timestamp(signal_row["timestamp"])
+    signal_close = float(signal_row["close"])
+
+    latest_date = date_only_from_timestamp(latest["timestamp"])
+    latest_close = float(latest["close"])
+
+    days_since_signal = len(trading_rows_after_date(df, signal_date_used))
+
+    after_or_signal = df.copy()
+    after_or_signal["date_only"] = pd.to_datetime(after_or_signal["timestamp"]).dt.date
+    after_or_signal = after_or_signal[after_or_signal["date_only"] >= signal_date_used].copy()
+
+    max_gain = None
+    max_drawdown = None
+
+    if not after_or_signal.empty and signal_close:
+        highest_close = float(after_or_signal["close"].max())
+        lowest_close = float(after_or_signal["close"].min())
+        max_gain = (highest_close / signal_close - 1) * 100
+        max_drawdown = (lowest_close / signal_close - 1) * 100
+
+    sell_info = assess_manual_sell_signal(df, signal_close)
+
+    current_return = return_since_signal(latest_close, signal_close)
+
+    return {
+        "ticker": symbol,
+        "original_signal_type": original_signal_type,
+        "input_signal_date": str(signal_date_input),
+        "signal_date_used": str(signal_date_used),
+        "signal_close": round(signal_close, 2),
+        "latest_date": str(latest_date),
+        "latest_close": round(latest_close, 2),
+        "days_since_signal": days_since_signal,
+        "current_return_pct": round(current_return, 2) if current_return is not None else None,
+        "return_1d_pct": round(n_trading_day_return(df, signal_date_used, signal_close, 1), 2) if n_trading_day_return(df, signal_date_used, signal_close, 1) is not None else None,
+        "return_3d_pct": round(n_trading_day_return(df, signal_date_used, signal_close, 3), 2) if n_trading_day_return(df, signal_date_used, signal_close, 3) is not None else None,
+        "return_5d_pct": round(n_trading_day_return(df, signal_date_used, signal_close, 5), 2) if n_trading_day_return(df, signal_date_used, signal_close, 5) is not None else None,
+        "return_10d_pct": round(n_trading_day_return(df, signal_date_used, signal_close, 10), 2) if n_trading_day_return(df, signal_date_used, signal_close, 10) is not None else None,
+        "return_20d_pct": round(n_trading_day_return(df, signal_date_used, signal_close, 20), 2) if n_trading_day_return(df, signal_date_used, signal_close, 20) is not None else None,
+        "max_gain_since_signal_pct": round(max_gain, 2) if max_gain is not None else None,
+        "max_drawdown_since_signal_pct": round(max_drawdown, 2) if max_drawdown is not None else None,
+        "sell_signal_type": sell_info.get("sell_signal_type"),
+        "sell_notice_date": sell_info.get("sell_notice_date"),
+        "sell_signal_price": sell_info.get("sell_signal_price"),
+        "exit_reason": sell_info.get("exit_reason"),
+        "stop_loss_hit": sell_info.get("stop_loss_hit"),
+        "box_breakdown": sell_info.get("box_breakdown"),
+        "macd_cross_down": sell_info.get("macd_cross_down"),
+        "close_below_ma10": sell_info.get("close_below_ma10"),
+        "three_down_days": sell_info.get("three_down_days"),
+        "medium_warning_count": sell_info.get("medium_warning_count"),
+        "error": "",
+    }
+
+
+def summarize_manual_tracker_results(results_df: pd.DataFrame) -> pd.DataFrame:
+    if results_df.empty:
+        return pd.DataFrame()
+
+    valid_df = results_df[results_df["error"].fillna("") == ""].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for sell_type, group in valid_df.groupby("sell_signal_type", dropna=False):
+        rows.append(
+            {
+                "Sell Status": sell_type,
+                "Count": len(group),
+                "Average Current Return %": round(group["current_return_pct"].dropna().mean(), 2) if "current_return_pct" in group else None,
+                "Win Rate %": round((group["current_return_pct"].dropna() > 0).mean() * 100, 2) if group["current_return_pct"].dropna().size else None,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # APP UI
 # ============================================================
@@ -1389,6 +1744,7 @@ with st.sidebar:
     )
 
     st.markdown("📧 [diffieliu@gmail.com](mailto:diffieliu@gmail.com)")
+    st.markdown("🔗 [LinkedIn: Diffie Liu](https://www.linkedin.com/in/diffie-liu/)")
     st.write("📞 909-689-6496")
 
     st.divider()
@@ -1406,11 +1762,12 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-tab_single, tab_sp500, tab_subscribe = st.tabs(
+tab_single, tab_sp500, tab_subscribe, tab_performance = st.tabs(
     [
         "🔎 Individual Stock Scanner",
         "📋 Index Scanner",
         "📬 Daily Email Alerts",
+        "📊 Manual Performance Tracker",
     ]
 )
 
@@ -1613,17 +1970,19 @@ with tab_sp500:
 
             signal_counts = results_df["final_signal"].value_counts().to_dict()
 
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-            c1.metric("BUY", signal_counts.get("BUY SIGNAL", 0))
-            c2.metric("ALMOST BUY", signal_counts.get("ALMOST BUY", 0))
-            c3.metric("WATCHLIST", signal_counts.get("WATCHLIST", 0))
-            c4.metric("NO ACTION", signal_counts.get("NO ACTION", 0))
-            c5.metric("ERROR", signal_counts.get("ERROR", 0))
+            c1.metric("HIGH CONVICTION", signal_counts.get("HIGH CONVICTION BUY", 0))
+            c2.metric("BUY", signal_counts.get("BUY SIGNAL", 0))
+            c3.metric("ALMOST BUY", signal_counts.get("ALMOST BUY", 0))
+            c4.metric("WATCHLIST", signal_counts.get("WATCHLIST", 0))
+            c5.metric("NO ACTION", signal_counts.get("NO ACTION", 0))
+            c6.metric("ERROR", signal_counts.get("ERROR", 0))
 
             st.subheader("Filter Results")
 
             available_signals = [
+                "HIGH CONVICTION BUY",
                 "BUY SIGNAL",
                 "ALMOST BUY",
                 "WATCHLIST",
@@ -1634,7 +1993,7 @@ with tab_sp500:
             selected_signals = st.multiselect(
                 "Signal filter",
                 available_signals,
-                default=["BUY SIGNAL", "ALMOST BUY"],
+                default=["HIGH CONVICTION BUY", "BUY SIGNAL", "ALMOST BUY"],
             )
 
             sectors = sorted(results_df["sector"].dropna().unique().tolist())
@@ -1679,6 +2038,11 @@ with tab_sp500:
                 "distance_from_ma20_pct",
                 "box_top",
                 "box_bottom",
+                "volume_confirmed",
+                "relative_strength_confirmed",
+                "universe_benchmark_confirmed",
+                "stock_ret20",
+                "qqq_ret20",
                 "failed_checks",
             ]
 
@@ -1717,20 +2081,20 @@ with tab_sp500:
                 mime="text/csv",
             )
 
-            st.subheader("Top BUY / ALMOST BUY List")
+            st.subheader("Top HIGH CONVICTION / BUY / ALMOST BUY List")
 
             top_df = results_df[
-                results_df["final_signal"].isin(["BUY SIGNAL", "ALMOST BUY"])
+                results_df["final_signal"].isin(["HIGH CONVICTION BUY", "BUY SIGNAL", "ALMOST BUY"])
             ].copy()
 
             if top_df.empty:
-                st.write(f"No BUY SIGNAL or ALMOST BUY stocks in {selected_universe} right now.")
+                st.write(f"No HIGH CONVICTION, BUY SIGNAL, or ALMOST BUY stocks in {selected_universe} right now.")
 
                 st.text_area(
-                    "All BUY SIGNAL + ALMOST BUY tickers",
+                    "All HIGH CONVICTION + BUY SIGNAL + ALMOST BUY tickers",
                     value="",
                     height=80,
-                    key=f"copy_buy_almost_empty_{safe_universe_name}",
+                    key=f"copy_high_buy_almost_empty_{safe_universe_name}",
                     help="No BUY SIGNAL or ALMOST BUY tickers are available right now.",
                 )
 
@@ -1758,10 +2122,10 @@ with tab_sp500:
                 st.subheader("Copyable Ticker Lists")
 
                 st.text_area(
-                    "All BUY SIGNAL + ALMOST BUY tickers",
+                    "All HIGH CONVICTION + BUY SIGNAL + ALMOST BUY tickers",
                     value=buy_almost_tickers,
                     height=90,
-                    key=f"copy_all_buy_almost_tickers_{safe_universe_name}",
+                    key=f"copy_all_high_buy_almost_tickers_{safe_universe_name}",
                     help="Copy this list for your tracker, watchlist, or notes.",
                 )
 
@@ -1781,17 +2145,6 @@ with tab_sp500:
                         value=almost_buy_only_tickers,
                         height=90,
                         key=f"copy_almost_buy_only_tickers_{safe_universe_name}",
-                    )
-
-                st.write("**Detailed BUY / ALMOST BUY results:**")
-
-                for _, row in top_df.iterrows():
-                    st.write(
-                        f"**{row['symbol']}** | {row['company_name']} | "
-                        f"{row['final_signal']} | "
-                        f"Score {row['buy_score']}/{row['buy_total']} | "
-                        f"Close {row['latest_close']} | "
-                        f"Missing: {row['failed_checks']}"
                     )
 
         except Exception as e:
@@ -1921,3 +2274,269 @@ with tab_subscribe:
             "Every daily email includes a private manage link so subscribers can "
             "change their selected lists or cancel."
         )
+
+
+# ============================================================
+# TAB 4: MANUAL PERFORMANCE / SELL TRACKER
+# ============================================================
+
+with tab_performance:
+    st.markdown("## 📊 Manual Performance / Sell Signal Tracker")
+
+    st.info(
+        "Paste the ticker list you copied from the Index Scanner, choose the original signal date, "
+        "and this page will calculate returns from that signal-date close and check whether any ticker "
+        "currently has SELL SIGNAL, ALMOST SELL, CAUTION HOLD, or HOLD."
+    )
+
+    st.caption(
+        "This page does not automatically save every scanner result. It only checks the tickers you paste here."
+    )
+
+    with st.expander("How this manual tracker works", expanded=True):
+        st.markdown(
+            f"""
+            **Input workflow**
+
+            1. Run the Index Scanner.
+            2. Copy the ticker list from BUY / ALMOST BUY.
+            3. Paste the tickers here.
+            4. Enter the date when you received the signal.
+            5. Click **Run Manual Tracker**.
+
+            **Return rule**
+
+            Return starts from the closing price of the completed candle on the signal date.
+            If the input date is a weekend or holiday, the app uses the most recent trading day before that date.
+
+            **Sell-status logic**
+
+            - **SELL SIGNAL** = stop loss hit, Box breakdown, or 2+ medium sell warnings.
+            - **ALMOST SELL** = 1 medium warning plus weak price structure.
+            - **CAUTION HOLD** = 1 medium warning, but structure is not weak enough for Almost Sell.
+            - **HOLD** = no sell warning.
+
+            Stop loss uses the original signal close:
+            `{STOP_LOSS_PCT * 100:.0f}%` below the signal-date close.
+            """
+        )
+
+    default_signal_date = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)
+
+    col_input_left, col_input_right = st.columns([2, 1])
+
+    with col_input_left:
+        pasted_tickers = st.text_area(
+            "Paste tickers from scanner",
+            value="",
+            height=130,
+            placeholder="TSLA, AAPL, NVDA, MSFT",
+            help="You can paste comma-separated tickers or one ticker per line.",
+        )
+
+    with col_input_right:
+        signal_date_input = st.date_input(
+            "Original signal date",
+            value=default_signal_date,
+            help="The date you received the BUY / ALMOST BUY signal.",
+        )
+
+        original_signal_type = st.selectbox(
+            "Original signal type",
+            [
+                "MIXED LIST",
+                "HIGH CONVICTION BUY",
+                "BUY SIGNAL",
+                "ALMOST BUY",
+            ],
+            index=0,
+        )
+
+        run_manual_tracker = st.button("Run Manual Tracker", type="primary")
+
+    if run_manual_tracker:
+        tickers = parse_ticker_list(pasted_tickers)
+
+        if not tickers:
+            st.error("Please paste at least one ticker.")
+        else:
+            st.write(f"Tracking {len(tickers)} tickers from signal date: **{signal_date_input}**")
+
+            rows = []
+            progress = st.progress(0)
+            status_text = st.empty()
+
+            for i, ticker in enumerate(tickers, start=1):
+                status_text.write(f"Checking {ticker} ({i}/{len(tickers)})...")
+                try:
+                    row = build_manual_tracker_row(
+                        symbol=ticker,
+                        signal_date_input=signal_date_input,
+                        original_signal_type=original_signal_type,
+                    )
+                except Exception as e:
+                    row = {
+                        "ticker": ticker,
+                        "original_signal_type": original_signal_type,
+                        "input_signal_date": str(signal_date_input),
+                        "error": str(e),
+                    }
+
+                rows.append(row)
+                progress.progress(i / len(tickers))
+
+            status_text.empty()
+            progress.empty()
+
+            results_df = pd.DataFrame(rows)
+
+            st.divider()
+
+            error_df = results_df[results_df["error"].fillna("") != ""].copy()
+            clean_df = results_df[results_df["error"].fillna("") == ""].copy()
+
+            if not error_df.empty:
+                st.warning("Some tickers could not be checked.")
+                st.dataframe(
+                    error_df[["ticker", "error"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if clean_df.empty:
+                st.error("No valid ticker results were generated.")
+            else:
+                st.subheader("Manual Tracking Summary")
+
+                sell_counts = clean_df["sell_signal_type"].value_counts().to_dict()
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("SELL SIGNAL", sell_counts.get("SELL SIGNAL", 0))
+                c2.metric("ALMOST SELL", sell_counts.get("ALMOST SELL", 0))
+                c3.metric("CAUTION HOLD", sell_counts.get("CAUTION HOLD", 0))
+                c4.metric("HOLD", sell_counts.get("HOLD", 0))
+                c5.metric("Avg Return", f"{clean_df['current_return_pct'].dropna().mean():.2f}%")
+
+                summary_df = summarize_manual_tracker_results(clean_df)
+
+                if not summary_df.empty:
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                st.subheader("Filter Manual Results")
+
+                status_options = ["SELL SIGNAL", "ALMOST SELL", "CAUTION HOLD", "HOLD", "UNKNOWN"]
+                selected_status_options = st.multiselect(
+                    "Sell status filter",
+                    status_options,
+                    default=["SELL SIGNAL", "ALMOST SELL", "CAUTION HOLD", "HOLD"],
+                )
+
+                filtered_manual_df = clean_df[
+                    clean_df["sell_signal_type"].isin(selected_status_options)
+                ].copy()
+
+                display_cols = [
+                    "ticker",
+                    "original_signal_type",
+                    "signal_date_used",
+                    "signal_close",
+                    "latest_date",
+                    "latest_close",
+                    "current_return_pct",
+                    "return_1d_pct",
+                    "return_3d_pct",
+                    "return_5d_pct",
+                    "return_10d_pct",
+                    "return_20d_pct",
+                    "max_gain_since_signal_pct",
+                    "max_drawdown_since_signal_pct",
+                    "sell_signal_type",
+                    "sell_notice_date",
+                    "sell_signal_price",
+                    "exit_reason",
+                    "stop_loss_hit",
+                    "box_breakdown",
+                    "macd_cross_down",
+                    "close_below_ma10",
+                    "three_down_days",
+                ]
+
+                display_cols = [col for col in display_cols if col in filtered_manual_df.columns]
+
+                st.subheader("Manual Tracker Results")
+                st.dataframe(
+                    filtered_manual_df[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                sell_tickers = ", ".join(
+                    filtered_manual_df[
+                        filtered_manual_df["sell_signal_type"] == "SELL SIGNAL"
+                    ]["ticker"].dropna().astype(str).tolist()
+                )
+
+                almost_sell_tickers = ", ".join(
+                    filtered_manual_df[
+                        filtered_manual_df["sell_signal_type"] == "ALMOST SELL"
+                    ]["ticker"].dropna().astype(str).tolist()
+                )
+
+                caution_tickers = ", ".join(
+                    filtered_manual_df[
+                        filtered_manual_df["sell_signal_type"] == "CAUTION HOLD"
+                    ]["ticker"].dropna().astype(str).tolist()
+                )
+
+                hold_tickers = ", ".join(
+                    filtered_manual_df[
+                        filtered_manual_df["sell_signal_type"] == "HOLD"
+                    ]["ticker"].dropna().astype(str).tolist()
+                )
+
+                st.subheader("Copyable Result Lists")
+
+                col_copy_1, col_copy_2 = st.columns(2)
+
+                with col_copy_1:
+                    st.text_area(
+                        "SELL SIGNAL tickers",
+                        value=sell_tickers,
+                        height=80,
+                        key="manual_tracker_sell_tickers",
+                    )
+
+                    st.text_area(
+                        "ALMOST SELL tickers",
+                        value=almost_sell_tickers,
+                        height=80,
+                        key="manual_tracker_almost_sell_tickers",
+                    )
+
+                with col_copy_2:
+                    st.text_area(
+                        "CAUTION HOLD tickers",
+                        value=caution_tickers,
+                        height=80,
+                        key="manual_tracker_caution_tickers",
+                    )
+
+                    st.text_area(
+                        "HOLD tickers",
+                        value=hold_tickers,
+                        height=80,
+                        key="manual_tracker_hold_tickers",
+                    )
+
+                csv_data = results_df.to_csv(index=False).encode("utf-8")
+
+                st.download_button(
+                    label="Download manual tracker results as CSV",
+                    data=csv_data,
+                    file_name=f"manual_tracker_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv",
+                    mime="text/csv",
+                )
+
+                st.caption(
+                    "This manual tracker does not store your pasted list. Download the CSV if you want to keep the record."
+                )
